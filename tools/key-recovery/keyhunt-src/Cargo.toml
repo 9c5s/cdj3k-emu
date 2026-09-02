@@ -1,0 +1,13 @@
+# リポジトリのワークスペース配下に置くため、親に取り込まれないよう独立ワークスペースとして宣言する。
+[workspace]
+
+[package]
+name = "keyhunt"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+cdj3k-emu-firmware = { path = "../../../crates/cdj3k-emu-firmware" }
+
+[profile.release]
+opt-level = 3
