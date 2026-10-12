@@ -1,13 +1,12 @@
 //! Native menu bar, via `muda`.
 //!
 //! `muda` is retained: items are built once and mutated afterwards. The
-//! service is declarative and hands over a whole model each frame, so this is
-//! where the two meet — the previous model is kept and compared, rows that
-//! only changed text or state are written in place, and a menu is rebuilt
-//! only when its shape actually changed.
+//! service hands over a whole model each frame, so this provider keeps the
+//! previous model and compares the two. Rows whose text or state changed are
+//! updated in place, and a menu is rebuilt only when its shape changed.
 
 use muda::accelerator::{Accelerator, Code, Modifiers};
-use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
 use super::id::MenuId;
 use super::model::{same_shape, MenuModel, MenuNode, Notice, Predefined};
@@ -28,8 +27,8 @@ fn readout_text(title: &str, value: &str, detail: &Option<String>) -> String {
     }
 }
 
-/// The action's shortcut, as muda spells it. `CmdOrCtrl` is muda's name for
-/// the primary modifier.
+/// The action's shortcut, as muda spells it. The primary modifier maps to
+/// `Modifiers::META`, which is Command on macOS.
 fn accelerator_for(id: &MenuId) -> Option<Accelerator> {
     let accel = id.accelerator()?;
     let mut mods = Modifiers::empty();
@@ -42,8 +41,7 @@ fn accelerator_for(id: &MenuId) -> Option<Accelerator> {
     Some(Accelerator::new(Some(mods), code_for(accel.key)?))
 }
 
-/// Only the keys the menu actually uses; an unknown one yields no shortcut
-/// rather than a wrong one.
+/// Map the keys the menu uses; any other key gets no shortcut.
 fn code_for(key: &str) -> Option<Code> {
     Some(match key {
         "R" => Code::KeyR,
@@ -54,12 +52,13 @@ fn code_for(key: &str) -> Option<Code> {
     })
 }
 
-/// Handles for the rows we mutate. Kinds without mutable state hold nothing.
+/// Handles for the rows that change after they are built. Rows without
+/// mutable state hold nothing.
 enum Native {
     Item(MenuItem),
     Check(CheckMenuItem),
-    /// A disabled row whose text changes — section headers and the latency
-    /// readout are both this.
+    /// A disabled row whose text changes, such as a section header or the
+    /// latency readout.
     Label(MenuItem),
     Inert,
     Submenu {
@@ -117,7 +116,7 @@ fn install(model: &MenuModel) -> Installed {
     let mut natives = Vec::with_capacity(model.roots.len());
     for node in &model.roots {
         let native = build(node);
-        append_to_root(&root, node, &native);
+        add_row(&root, node, &native);
         natives.push(native);
     }
     // The service reads the notice once per window, so it is built once.
@@ -204,8 +203,8 @@ fn build(node: &MenuNode) -> Native {
         MenuNode::Label(text) | MenuNode::Section(text) => {
             Native::Label(MenuItem::new(text, false, None))
         }
-        // A native menu has no place for a multi-line figure, so it reads as
-        // the one disabled line it would have been anyway.
+        // A native menu cannot show a multi-line figure, so the readout becomes
+        // one disabled line.
         MenuNode::Readout {
             title,
             value,
@@ -245,49 +244,37 @@ fn build(node: &MenuNode) -> Native {
 /// Add one row to `parent`. A section heading below other rows gets a
 /// separator above it, the way a native menu sets a group apart.
 fn append(parent: &Submenu, node: &MenuNode, native: &Native, first: bool) {
-    match (node, native) {
-        (MenuNode::Separator, _) => {
-            parent.append(&PredefinedMenuItem::separator()).ok();
-        }
-        (MenuNode::Section(_), Native::Label(item)) => {
-            if !first {
-                parent.append(&PredefinedMenuItem::separator()).ok();
-            }
-            parent.append(item).ok();
-        }
-        (MenuNode::Predefined(Predefined::Quit), _) => {
-            parent.append(&PredefinedMenuItem::quit(None)).ok();
-        }
-        (_, Native::Item(item)) | (_, Native::Label(item)) => {
-            parent.append(item).ok();
-        }
-        (_, Native::Check(item)) => {
-            parent.append(item).ok();
-        }
-        (_, Native::Submenu { handle, .. }) => {
-            parent.append(handle).ok();
-        }
-        (_, Native::Inert) => {}
+    if !first && matches!((node, native), (MenuNode::Section(_), Native::Label(_))) {
+        parent.add(&PredefinedMenuItem::separator());
+    }
+    add_row(parent, node, native);
+}
+
+/// What a row is added to: the bar itself, or one of its menus.
+trait Container {
+    fn add(&self, item: &dyn IsMenuItem);
+}
+
+impl Container for Menu {
+    fn add(&self, item: &dyn IsMenuItem) {
+        self.append(item).ok();
     }
 }
 
-fn append_to_root(root: &Menu, node: &MenuNode, native: &Native) {
+impl Container for Submenu {
+    fn add(&self, item: &dyn IsMenuItem) {
+        self.append(item).ok();
+    }
+}
+
+/// Add the native widget for one row; muda supplies separators and Quit.
+fn add_row(parent: &impl Container, node: &MenuNode, native: &Native) {
     match (node, native) {
-        (MenuNode::Separator, _) => {
-            root.append(&PredefinedMenuItem::separator()).ok();
-        }
-        (MenuNode::Predefined(Predefined::Quit), _) => {
-            root.append(&PredefinedMenuItem::quit(None)).ok();
-        }
-        (_, Native::Item(item)) | (_, Native::Label(item)) => {
-            root.append(item).ok();
-        }
-        (_, Native::Check(item)) => {
-            root.append(item).ok();
-        }
-        (_, Native::Submenu { handle, .. }) => {
-            root.append(handle).ok();
-        }
+        (MenuNode::Separator, _) => parent.add(&PredefinedMenuItem::separator()),
+        (MenuNode::Predefined(Predefined::Quit), _) => parent.add(&PredefinedMenuItem::quit(None)),
+        (_, Native::Item(item)) | (_, Native::Label(item)) => parent.add(item),
+        (_, Native::Check(item)) => parent.add(item),
+        (_, Native::Submenu { handle, .. }) => parent.add(handle),
         (_, Native::Inert) => {}
     }
 }
@@ -296,9 +283,9 @@ fn append_to_root(root: &Menu, node: &MenuNode, native: &Native) {
 
 /// Update one list of siblings in place, or rebuild it into `parent`.
 ///
-/// `parent` is `None` at the root, which never changes shape — the model
-/// always yields the same six submenus — so the rebuild arm cannot be reached
-/// there and a shape change is simply not applied.
+/// `parent` is `None` at the root. The root never changes shape, because the
+/// model always yields the same six submenus, so a shape change there is not
+/// applied.
 fn reconcile_level(
     natives: &mut Vec<Native>,
     old: &[MenuNode],
@@ -325,64 +312,91 @@ fn reconcile_level(
 
 /// Write the differences for one row that kept its slot.
 fn update(native: &mut Native, old: &MenuNode, new: &MenuNode) {
-    match (native, old, new) {
-        (
-            Native::Item(item),
-            MenuNode::Item {
-                label: was,
-                enabled: was_on,
-                detail: was_detail,
-                ..
-            },
-            MenuNode::Item {
-                label: now,
-                enabled: now_on,
-                detail: now_detail,
-                ..
-            },
-        ) => {
-            if was != now || was_detail != now_detail {
-                item.set_text(row_text(now, now_detail));
-            }
-            if was_on != now_on {
-                item.set_enabled(*now_on);
-            }
-        }
-        (
-            Native::Check(item),
-            MenuNode::Check {
-                label: was,
-                enabled: was_on,
-                checked: was_tick,
-                detail: was_detail,
-                ..
-            },
-            MenuNode::Check {
-                label: now,
-                enabled: now_on,
-                checked: now_tick,
-                detail: now_detail,
-                ..
-            },
-        ) => {
-            if was != now || was_detail != now_detail {
-                item.set_text(row_text(now, now_detail));
-            }
-            if was_on != now_on {
-                item.set_enabled(*now_on);
-            }
-            if was_tick != now_tick {
-                item.set_checked(*now_tick);
-            }
-        }
-        (Native::Label(item), MenuNode::Label(was), MenuNode::Label(now))
-        | (Native::Label(item), MenuNode::Section(was), MenuNode::Section(now)) => {
+    match native {
+        Native::Item(item) => update_item(item, old, new),
+        Native::Check(item) => update_check(item, old, new),
+        Native::Label(item) => update_label(item, old, new),
+        Native::Submenu { handle, children } => update_submenu(handle, children, old, new),
+        Native::Inert => {}
+    }
+}
+
+/// The row's new text, when its label or its value changed.
+fn changed_text(
+    was: &str,
+    was_detail: &Option<String>,
+    now: &str,
+    now_detail: &Option<String>,
+) -> Option<String> {
+    (was != now || was_detail != now_detail).then(|| row_text(now, now_detail))
+}
+
+fn update_item(item: &MenuItem, old: &MenuNode, new: &MenuNode) {
+    let (
+        MenuNode::Item {
+            label: was,
+            enabled: was_on,
+            detail: was_detail,
+            ..
+        },
+        MenuNode::Item {
+            label: now,
+            enabled: now_on,
+            detail: now_detail,
+            ..
+        },
+    ) = (old, new)
+    else {
+        return;
+    };
+    if let Some(text) = changed_text(was, was_detail, now, now_detail) {
+        item.set_text(text);
+    }
+    if was_on != now_on {
+        item.set_enabled(*now_on);
+    }
+}
+
+fn update_check(item: &CheckMenuItem, old: &MenuNode, new: &MenuNode) {
+    let (
+        MenuNode::Check {
+            label: was,
+            enabled: was_on,
+            checked: was_tick,
+            detail: was_detail,
+            ..
+        },
+        MenuNode::Check {
+            label: now,
+            enabled: now_on,
+            checked: now_tick,
+            detail: now_detail,
+            ..
+        },
+    ) = (old, new)
+    else {
+        return;
+    };
+    if let Some(text) = changed_text(was, was_detail, now, now_detail) {
+        item.set_text(text);
+    }
+    if was_on != now_on {
+        item.set_enabled(*now_on);
+    }
+    if was_tick != now_tick {
+        item.set_checked(*now_tick);
+    }
+}
+
+fn update_label(item: &MenuItem, old: &MenuNode, new: &MenuNode) {
+    match (old, new) {
+        (MenuNode::Label(was), MenuNode::Label(now))
+        | (MenuNode::Section(was), MenuNode::Section(now)) => {
             if was != now {
                 item.set_text(now);
             }
         }
         (
-            Native::Label(item),
             MenuNode::Readout { .. },
             MenuNode::Readout {
                 title,
@@ -390,27 +404,30 @@ fn update(native: &mut Native, old: &MenuNode, new: &MenuNode) {
                 detail,
             },
         ) => item.set_text(readout_text(title, value, detail)),
-        (
-            Native::Submenu { handle, children },
-            MenuNode::Submenu {
-                enabled: was_on,
-                children: old_children,
-                ..
-            },
-            MenuNode::Submenu {
-                enabled: now_on,
-                children: new_children,
-                ..
-            },
-        ) => {
-            if was_on != now_on {
-                handle.set_enabled(*now_on);
-            }
-            let handle = handle.clone();
-            reconcile_level(children, old_children, new_children, Some(&handle));
-        }
         _ => {}
     }
+}
+
+fn update_submenu(handle: &Submenu, children: &mut Vec<Native>, old: &MenuNode, new: &MenuNode) {
+    let (
+        MenuNode::Submenu {
+            enabled: was_on,
+            children: old_children,
+            ..
+        },
+        MenuNode::Submenu {
+            enabled: now_on,
+            children: new_children,
+            ..
+        },
+    ) = (old, new)
+    else {
+        return;
+    };
+    if was_on != now_on {
+        handle.set_enabled(*now_on);
+    }
+    reconcile_level(children, old_children, new_children, Some(handle));
 }
 
 #[cfg(test)]
@@ -420,13 +437,13 @@ mod tests {
     #[test]
     fn a_notice_paragraph_wraps_at_spaces() {
         let lines = wrap(
-            "Host is x86_64, target is arm64 and virtualizes only same-arch guests.",
+            "This host is x86_64 and the guest is arm64, so every instruction is translated.",
             24,
         );
         assert!(lines.iter().all(|l| l.chars().count() <= 24), "{lines:?}");
         assert_eq!(
             lines.join(" "),
-            "Host is x86_64, target is arm64 and virtualizes only same-arch guests."
+            "This host is x86_64 and the guest is arm64, so every instruction is translated."
         );
     }
 

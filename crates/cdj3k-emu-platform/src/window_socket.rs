@@ -7,7 +7,7 @@
 //! connects, writes one command and reads one reply line; then the window
 //! closes the connection.
 //!
-//!   client → window
+//!   Commands (client to window):
 //!     delete            - stop the emulation and empty the slot
 //!     quit              - stop the emulation and close, as Quit does
 //!     restart-mods      - restart the emulation with the slot's mods
@@ -18,7 +18,7 @@
 //!     restart-pending   - ask whether a restart would boot different mods;
 //!                         the reply is yes or no
 //!
-//!   window → client
+//!   Replies (window to client):
 //!     ok                - the command is done or in progress
 //!     yes, no           - the window's answer to `restart-pending`
 //!     busy              - the window is installing, stopping or closing, or
@@ -166,7 +166,7 @@ fn send_at(path: &Path, command: Command) -> io::Result<Option<Reply>> {
     Reply::parse(line).map(Some).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected reply {line:?}"),
+            format!("the window sent an unexpected reply {line:?}"),
         )
     })
 }

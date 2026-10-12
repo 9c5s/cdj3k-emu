@@ -1,46 +1,52 @@
 // Bloom post-processing pipeline.
 //
-// Single PaintCallback at Order::Debug (last GL op of the frame):
-//   1. glBlitFramebuffer: screen → copy_fbo  (GPU blit of current egui frame)
-//   2. Threshold: copy_tex → blur_fbo[0]  (half-res, bright + saturated pixels only,
-//                                           LCD rects masked out, except where a
-//                                           control stands over them)
-//   3. H-blur: blur_fbo[0] → blur_fbo[1]
-//   4. V-blur: blur_fbo[1] → blur_fbo[0]
-//   5. Additive composite: blur_tex[0]*strength → screen, under the same mask,
-//      so no halo lands on a screen
+// One PaintCallback at Order::Debug, the last GL operation of the frame, runs
+// five passes:
+//   1. `glBlitFramebuffer` copies the current egui frame from the screen into
+//      `copy_fbo`.
+//   2. The threshold pass writes `copy_tex` into `blur_fbo[0]` at half
+//      resolution. It keeps only bright, saturated pixels and masks out the LCD
+//      rects, except where a control stands over them.
+//   3. The horizontal blur writes `blur_fbo[0]` into `blur_fbo[1]`.
+//   4. The vertical blur writes `blur_fbo[1]` back into `blur_fbo[0]`.
+//   5. The composite adds `blur_tex[0]` times the strength onto the screen,
+//      under the same mask, so no halo lands on a screen.
 //
-// Feedback is structurally bounded: the blur halo around an LED (~0.03 at 2 px)
-// is far below BLOOM_THRESHOLD, so halo pixels can never re-bloom themselves.
+// The halo around an LED (about 0.03 at 2 px) is far below BLOOM_THRESHOLD, so
+// halo pixels never bloom again on the next frame.
 
 use egui::Rect;
 use glow::HasContext;
 use std::sync::{Arc, Mutex};
 
+mod shaders;
+
+use shaders::{BLUR_FRAG, COMPOSITE_FRAG, THRESHOLD_FRAG, VERT};
+
 // ── Tuning constants ───────────────────────────────────────────────────────────
 
-/// Minimum brightness (max of R/G/B) for a pixel to enter the bloom.
-/// Dimmest lit LED in the palette is COL_BTN_GREEN (200/255 = 0.784),
-/// so this must be below that.
+/// Minimum brightness, the largest of R, G and B, for a pixel to enter the
+/// bloom. It must stay below the dimmest lit LED in the palette, COL_GREEN
+/// (200/255 = 0.784).
 pub const BLOOM_THRESHOLD: f32 = 0.55;
 
-/// Transition band above BLOOM_THRESHOLD: pixels ramp from 0 → full weight
-/// over [BLOOM_THRESHOLD, BLOOM_THRESHOLD * (1 + BLOOM_THRESHOLD_KNEE)].
+/// Transition band above BLOOM_THRESHOLD: a pixel's weight ramps from zero to
+/// full over [BLOOM_THRESHOLD, BLOOM_THRESHOLD * (1 + BLOOM_THRESHOLD_KNEE)].
 const BLOOM_THRESHOLD_KNEE: f32 = 0.20;
 
-/// Minimum HSV saturation for a pixel to bloom.
-/// Excludes grey/white UI chrome (COL_BTN_TEXT sat ≈ 0.05, COL_SILVER sat ≈ 0.09),
-/// except pure white, which is explicitly allowed in shader logic.
+/// Minimum HSV saturation for a pixel to bloom. It excludes grey and white UI
+/// chrome (COL_BTN_TEXT has a saturation of about 0.05, COL_SILVER about 0.09).
+/// The shader lets pure white bloom anyway.
 pub const BLOOM_SAT_MIN: f32 = 0.10;
 
-/// Saturation transition band: pixels ramp from 0 → full weight
-/// over [BLOOM_SAT_MIN, BLOOM_SAT_MIN + BLOOM_SAT_KNEE].
+/// Saturation transition band: a pixel's weight ramps from zero to full over
+/// [BLOOM_SAT_MIN, BLOOM_SAT_MIN + BLOOM_SAT_KNEE].
 const BLOOM_SAT_KNEE: f32 = 0.15;
 
 /// How much of the blurred layer is added to the scene.
 pub const BLOOM_STRENGTH: f32 = 0.9;
 
-/// Blur step size in half-res texel units (1.0 = one texel per tap).
+/// Blur step size in half-resolution texels; 1.0 is one texel per tap.
 pub const BLOOM_RADIUS: f32 = 1.0;
 
 /// Maximum number of LCD exclusion rectangles.
@@ -50,10 +56,11 @@ const MAX_KEEP_ZONES: usize = 2;
 /// Must match the `u_chrome` array size in the shaders.
 const MAX_CHROME_ZONES: usize = 8;
 
-/// A control standing over a masked screen rect, which blooms and takes bloom
-/// as usual: within `core_r` of `centre`, or within `outer_r` and inside a
-/// vertical band `half_w` wide or a sector `atan(tan_a)` either side of
-/// vertical. Logical points.
+/// A control drawn over a masked screen rect. Inside the control's area, it
+/// blooms and receives bloom as usual. The area is everything within `core_r`
+/// of `centre`, plus everything within `outer_r` that lies in a vertical band
+/// `half_w` wide or in a sector `atan(tan_a)` either side of vertical. Values
+/// are in logical points.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BloomKeep {
     pub centre: egui::Pos2,
@@ -68,152 +75,10 @@ pub struct BloomKeep {
 pub struct BloomMask {
     pub excludes: Vec<Rect>,
     pub keeps: Vec<BloomKeep>,
-    /// The application's own chrome — the menu strip and its panels — which
-    /// neither blooms nor takes a halo, whatever stands under it.
+    /// The application's own chrome, the menu strip and its panels. It neither
+    /// blooms nor receives a halo, whatever is drawn under it.
     pub chrome: Vec<Rect>,
 }
-
-// ── Shaders ────────────────────────────────────────────────────────────────────
-
-const VERT: &str = r#"
-#version 330 core
-out vec2 v_uv;
-void main() {
-    float x = float((gl_VertexID & 1) * 2) - 1.0;
-    float y = float((gl_VertexID >> 1) * 2) - 1.0;
-    v_uv = vec2(x, y) * 0.5 + 0.5;
-    gl_Position = vec4(x, y, 0.0, 1.0);
-}
-"#;
-
-// MAX_EXCLUDE_ZONES must match the Rust constant above.
-const THRESHOLD_FRAG: &str = r#"
-#version 330 core
-in vec2 v_uv;
-out vec4 out_color;
-uniform sampler2D u_scene;
-uniform float u_threshold;
-uniform float u_threshold_knee; // upper edge = threshold * (1 + knee)
-uniform float u_sat_min;
-uniform float u_sat_knee;
-uniform int  u_exclude_n;
-uniform vec4 u_exclude[4]; // (x0,y0,x1,y1) in UV space, Y=0 at bottom
-uniform int  u_keep_n;
-uniform vec4 u_keep_a[2]; // (cx, cy, core_r, outer_r) in pixels, Y=0 at bottom
-uniform vec2 u_keep_b[2]; // (half_w, tan_a)
-uniform vec2 u_screen_px;
-uniform int  u_chrome_n;
-uniform vec4 u_chrome[8]; // (x0,y0,x1,y1) in UV space, Y=0 at bottom
-bool kept(vec2 uv) {
-    vec2 p = uv * u_screen_px;
-    for (int i = 0; i < u_keep_n; i++) {
-        vec2 d = p - u_keep_a[i].xy;
-        float r = length(d);
-        if (r <= u_keep_a[i].z) return true;
-        if (r <= u_keep_a[i].w
-            && (abs(d.x) <= u_keep_b[i].x || abs(d.x) <= abs(d.y) * u_keep_b[i].y)) return true;
-    }
-    return false;
-}
-bool masked(vec2 uv) {
-    for (int i = 0; i < u_chrome_n; i++) {
-        vec4 r = u_chrome[i];
-        if (uv.x >= r.x && uv.x <= r.z && uv.y >= r.y && uv.y <= r.w) return true;
-    }
-    for (int i = 0; i < u_exclude_n; i++) {
-        vec4 r = u_exclude[i];
-        if (uv.x >= r.x && uv.x <= r.z && uv.y >= r.y && uv.y <= r.w) return !kept(uv);
-    }
-    return false;
-}
-void main() {
-    if (masked(v_uv)) {
-        out_color = vec4(0.0);
-        return;
-    }
-    vec3  scene    = texture(u_scene, v_uv).rgb;
-    float hi       = max(scene.r, max(scene.g, scene.b));
-    float lo       = min(scene.r, min(scene.g, scene.b));
-    float sat      = (hi > 0.001) ? (hi - lo) / hi : 0.0;
-    float bright_w = smoothstep(u_threshold, u_threshold * (1.0 + u_threshold_knee), hi);
-    float sat_w    = smoothstep(u_sat_min, u_sat_min + u_sat_knee, sat);
-    // Allow pure white LEDs to bloom while still filtering neutral UI chrome.
-    float white_w  = (scene.r >= 0.999 && scene.g >= 0.999 && scene.b >= 0.999) ? 1.0 : 0.0;
-    sat_w = max(sat_w, white_w);
-    out_color = vec4(scene * (bright_w * sat_w), 1.0);
-}
-"#;
-
-// 9-tap separable Gaussian kernel (σ ≈ 1.0, taps at offsets 0..4).
-// Weights are analytically derived and sum to 1.0.
-const BLUR_FRAG: &str = r#"
-#version 330 core
-in vec2 v_uv;
-out vec4 out_color;
-uniform sampler2D u_tex;
-uniform vec2 u_dir; // (step_x, 0) for H-pass, (0, step_y) for V-pass
-const float W[5] = float[5](
-    0.2270270, // offset 0
-    0.1945946, // offset ±1
-    0.1216216, // offset ±2
-    0.0540541, // offset ±3
-    0.0162162  // offset ±4
-);
-void main() {
-    vec4 c = texture(u_tex, v_uv) * W[0];
-    for (int i = 1; i < 5; i++) {
-        c += texture(u_tex, v_uv + u_dir * float(i)) * W[i];
-        c += texture(u_tex, v_uv - u_dir * float(i)) * W[i];
-    }
-    out_color = c;
-}
-"#;
-
-// Bloom-only overlay - drawn additively on top of egui's framebuffer.
-const COMPOSITE_FRAG: &str = r#"
-#version 330 core
-in vec2 v_uv;
-out vec4 out_color;
-uniform sampler2D u_bloom;
-uniform float u_strength;
-uniform int  u_exclude_n;
-uniform vec4 u_exclude[4]; // (x0,y0,x1,y1) in UV space, Y=0 at bottom
-uniform int  u_keep_n;
-uniform vec4 u_keep_a[2]; // (cx, cy, core_r, outer_r) in pixels, Y=0 at bottom
-uniform vec2 u_keep_b[2]; // (half_w, tan_a)
-uniform vec2 u_screen_px;
-uniform int  u_chrome_n;
-uniform vec4 u_chrome[8]; // (x0,y0,x1,y1) in UV space, Y=0 at bottom
-bool kept(vec2 uv) {
-    vec2 p = uv * u_screen_px;
-    for (int i = 0; i < u_keep_n; i++) {
-        vec2 d = p - u_keep_a[i].xy;
-        float r = length(d);
-        if (r <= u_keep_a[i].z) return true;
-        if (r <= u_keep_a[i].w
-            && (abs(d.x) <= u_keep_b[i].x || abs(d.x) <= abs(d.y) * u_keep_b[i].y)) return true;
-    }
-    return false;
-}
-bool masked(vec2 uv) {
-    for (int i = 0; i < u_chrome_n; i++) {
-        vec4 r = u_chrome[i];
-        if (uv.x >= r.x && uv.x <= r.z && uv.y >= r.y && uv.y <= r.w) return true;
-    }
-    for (int i = 0; i < u_exclude_n; i++) {
-        vec4 r = u_exclude[i];
-        if (uv.x >= r.x && uv.x <= r.z && uv.y >= r.y && uv.y <= r.w) return !kept(uv);
-    }
-    return false;
-}
-void main() {
-    if (masked(v_uv)) {
-        out_color = vec4(0.0);
-        return;
-    }
-    out_color = vec4(texture(u_bloom, v_uv).rgb * u_strength, 0.0);
-}
-"#;
 
 // ── Pipeline ───────────────────────────────────────────────────────────────────
 
@@ -222,16 +87,16 @@ pub struct BloomPipeline {
     blur_prog: glow::Program,
     composite_prog: glow::Program,
     quad_vao: glow::VertexArray,
-    // Full-res copy of the screen (input to threshold).
+    // A full-resolution copy of the screen, read by the threshold pass.
     copy_tex: Option<glow::Texture>,
     copy_fbo: Option<glow::Framebuffer>,
-    // Half-res ping-pong blur.
+    // Two half-resolution targets that the blur passes alternate between.
     blur_tex: Option<[glow::Texture; 2]>,
     blur_fbo: Option<[glow::Framebuffer; 2]>,
     size: [i32; 2],
     /// Hash of the inputs that produced the current `blur_tex[0]`. When `run()`
-    /// is called with a matching key, the blit + threshold + blur passes are
-    /// skipped and the cached blur is composited directly. Reset on resize.
+    /// gets a matching key, it skips the blit, threshold and blur passes and
+    /// composites the cached blur. A resize clears it.
     cache_key: Option<u64>,
 }
 
@@ -241,7 +106,9 @@ impl BloomPipeline {
             let threshold_prog = compile_program(gl, VERT, THRESHOLD_FRAG);
             let blur_prog = compile_program(gl, VERT, BLUR_FRAG);
             let composite_prog = compile_program(gl, VERT, COMPOSITE_FRAG);
-            let quad_vao = gl.create_vertex_array().expect("bloom vao");
+            let quad_vao = gl
+                .create_vertex_array()
+                .expect("could not create the bloom vertex array");
             Self {
                 threshold_prog,
                 blur_prog,
@@ -259,17 +126,17 @@ impl BloomPipeline {
 
     /// Run the bloom pass. Call from the Order::Debug PaintCallback.
     ///
-    /// `w`/`h` are physical pixels. `ppp` is pixels-per-point (DPI scale).
-    /// `mask` says where bloom neither starts nor lands (logical points, Y-down).
-    /// `scene_key` is a hash of every input that affects bloom-relevant pixels
-    /// (LED state, button hover, jog ring brightness, …). When the key matches
-    /// the cached one, the blit + threshold + blur passes are skipped and the
-    /// retained `blur_tex[0]` is composited directly - a >5× speedup of the
-    /// bloom callback on idle frames where nothing visual has changed.
+    /// `w` and `h` are in physical pixels, and `ppp` is pixels per point (the
+    /// DPI scale). `mask` marks where bloom neither starts nor lands, in logical
+    /// points with Y down. `scene_key` hashes every input that affects the
+    /// pixels that bloom, such as the LED state, button hover and jog ring
+    /// brightness. When the key matches the cached one, the blit, threshold and
+    /// blur passes are skipped and the retained `blur_tex[0]` is composited.
+    /// This makes the bloom callback more than five times faster on idle
+    /// frames.
     ///
-    /// The composite always runs because egui clears the framebuffer every
-    /// frame, so the additive overlay must be re-applied even when blur is
-    /// reused.
+    /// The composite always runs, because egui clears the framebuffer every
+    /// frame.
     pub fn run(
         &mut self,
         gl: &glow::Context,
@@ -284,6 +151,29 @@ impl BloomPipeline {
         }
         self.resize_if_needed(gl, w, h);
 
+        // Combine the caller's scene hash with the layout parameters that also
+        // invalidate the cached blur: the window size, the DPI and the mask
+        // rects. A resize already clears `cache_key`, but `ppp` and the mask
+        // can change without a resize.
+        let full_key = compose_key(scene_key, w, h, ppp, mask);
+        let blur_is_cached = self.cache_key == Some(full_key);
+
+        unsafe {
+            if !blur_is_cached {
+                self.blur_scene(gl, w, h, ppp, mask);
+                self.cache_key = Some(full_key);
+            } else {
+                gl.bind_vertex_array(Some(self.quad_vao));
+                gl.active_texture(glow::TEXTURE0);
+            }
+            self.composite(gl, w, h, ppp, mask);
+            restore_gl_state(gl);
+        }
+    }
+
+    /// Passes 1-4: copies the screen, thresholds it to half resolution and
+    /// blurs it both ways, leaving the result in `blur_tex[0]`.
+    unsafe fn blur_scene(&self, gl: &glow::Context, w: i32, h: i32, ppp: f32, mask: &BloomMask) {
         let hw = (w / 2).max(1);
         let hh = (h / 2).max(1);
         let copy_tex = self.copy_tex.unwrap();
@@ -291,102 +181,77 @@ impl BloomPipeline {
         let blur_tex = self.blur_tex.unwrap();
         let blur_fbo = self.blur_fbo.unwrap();
 
-        // Combine the caller-supplied scene hash with the layout-affecting
-        // parameters that also invalidate the cached blur (window size, DPI,
-        // exclusion rects). Resize already nukes `cache_key`, but ppp/exclude
-        // can change without triggering a resize.
-        let full_key = compose_key(scene_key, w, h, ppp, mask);
-        let blur_is_cached = self.cache_key == Some(full_key);
+        // ── 1. Blit the screen into copy_fbo ─────────────────────────────────
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(copy_fbo));
+        gl.blit_framebuffer(
+            0,
+            0,
+            w,
+            h,
+            0,
+            0,
+            w,
+            h,
+            glow::COLOR_BUFFER_BIT,
+            glow::NEAREST,
+        );
 
-        unsafe {
-            if !blur_is_cached {
-                // ── 1. GPU blit: screen → copy_fbo ───────────────────────────
-                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(copy_fbo));
-                gl.blit_framebuffer(
-                    0,
-                    0,
-                    w,
-                    h,
-                    0,
-                    0,
-                    w,
-                    h,
-                    glow::COLOR_BUFFER_BIT,
-                    glow::NEAREST,
-                );
+        gl.bind_vertex_array(Some(self.quad_vao));
 
-                gl.bind_vertex_array(Some(self.quad_vao));
+        // ── 2. Threshold copy_tex into blur_fbo[0] at half resolution ────────
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(blur_fbo[0]));
+        gl.viewport(0, 0, hw, hh);
+        gl.use_program(Some(self.threshold_prog));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(copy_tex));
+        set_1i(gl, self.threshold_prog, "u_scene", 0);
+        set_1f(gl, self.threshold_prog, "u_threshold", BLOOM_THRESHOLD);
+        set_1f(
+            gl,
+            self.threshold_prog,
+            "u_threshold_knee",
+            BLOOM_THRESHOLD_KNEE,
+        );
+        set_1f(gl, self.threshold_prog, "u_sat_min", BLOOM_SAT_MIN);
+        set_1f(gl, self.threshold_prog, "u_sat_knee", BLOOM_SAT_KNEE);
+        set_mask(gl, self.threshold_prog, mask, ppp, w, h);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-                // ── 2. Threshold: copy_tex → blur_fbo[0] (half-res) ──────────
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(blur_fbo[0]));
-                gl.viewport(0, 0, hw, hh);
-                gl.use_program(Some(self.threshold_prog));
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(copy_tex));
-                set_1i(gl, self.threshold_prog, "u_scene", 0);
-                set_1f(gl, self.threshold_prog, "u_threshold", BLOOM_THRESHOLD);
-                set_1f(
-                    gl,
-                    self.threshold_prog,
-                    "u_threshold_knee",
-                    BLOOM_THRESHOLD_KNEE,
-                );
-                set_1f(gl, self.threshold_prog, "u_sat_min", BLOOM_SAT_MIN);
-                set_1f(gl, self.threshold_prog, "u_sat_knee", BLOOM_SAT_KNEE);
-                set_mask(gl, self.threshold_prog, mask, ppp, w, h);
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        // ── 3. Blur blur_fbo[0] horizontally into blur_fbo[1] ────────────────
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(blur_fbo[1]));
+        gl.use_program(Some(self.blur_prog));
+        gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex[0]));
+        set_1i(gl, self.blur_prog, "u_tex", 0);
+        set_2f(gl, self.blur_prog, "u_dir", BLOOM_RADIUS / hw as f32, 0.0);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-                // ── 3. H-blur: blur_fbo[0] → blur_fbo[1] ─────────────────────
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(blur_fbo[1]));
-                gl.use_program(Some(self.blur_prog));
-                gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex[0]));
-                set_1i(gl, self.blur_prog, "u_tex", 0);
-                set_2f(gl, self.blur_prog, "u_dir", BLOOM_RADIUS / hw as f32, 0.0);
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        // ── 4. Blur blur_fbo[1] vertically into blur_fbo[0] ──────────────────
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(blur_fbo[0]));
+        gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex[1]));
+        set_2f(gl, self.blur_prog, "u_dir", 0.0, BLOOM_RADIUS / hh as f32);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    }
 
-                // ── 4. V-blur: blur_fbo[1] → blur_fbo[0] ─────────────────────
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(blur_fbo[0]));
-                gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex[1]));
-                set_2f(gl, self.blur_prog, "u_dir", 0.0, BLOOM_RADIUS / hh as f32);
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-
-                self.cache_key = Some(full_key);
-            } else {
-                gl.bind_vertex_array(Some(self.quad_vao));
-                gl.active_texture(glow::TEXTURE0);
-            }
-
-            // ── 5. Additive bloom → screen ────────────────────────────────────
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.viewport(0, 0, w, h);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.enable(glow::BLEND);
-            gl.blend_func_separate(
-                glow::ONE,
-                glow::ONE, // RGB: additive
-                glow::ZERO,
-                glow::ONE, // Alpha: preserve dst (egui writes 1.0)
-            );
-            gl.use_program(Some(self.composite_prog));
-            gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex[0]));
-            set_1i(gl, self.composite_prog, "u_bloom", 0);
-            set_1f(gl, self.composite_prog, "u_strength", BLOOM_STRENGTH);
-            set_mask(gl, self.composite_prog, mask, ppp, w, h);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-
-            // ── Restore GL state ──────────────────────────────────────────────
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            gl.blend_func_separate(
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
-                glow::ONE_MINUS_DST_ALPHA,
-                glow::ONE,
-            );
-            gl.use_program(None);
-            gl.bind_vertex_array(None);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
+    /// Pass 5: adds the blur onto the screen, under the mask.
+    unsafe fn composite(&self, gl: &glow::Context, w: i32, h: i32, ppp: f32, mask: &BloomMask) {
+        let blur_tex = self.blur_tex.unwrap();
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.viewport(0, 0, w, h);
+        gl.disable(glow::SCISSOR_TEST);
+        gl.enable(glow::BLEND);
+        gl.blend_func_separate(
+            glow::ONE,
+            glow::ONE, // RGB: additive
+            glow::ZERO,
+            glow::ONE, // Alpha: keep the destination's alpha, which egui writes as 1.0
+        );
+        gl.use_program(Some(self.composite_prog));
+        gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex[0]));
+        set_1i(gl, self.composite_prog, "u_bloom", 0);
+        set_1f(gl, self.composite_prog, "u_strength", BLOOM_STRENGTH);
+        set_mask(gl, self.composite_prog, mask, ppp, w, h);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
 
     pub fn destroy(&self, gl: &glow::Context) {
@@ -441,18 +306,30 @@ impl BloomPipeline {
             self.blur_tex = Some([bt0, bt1]);
             self.blur_fbo = Some([bf0, bf1]);
             self.size = [w, h];
-            // Cached blur is sized for the previous viewport - invalidate it
-            // so the next frame regenerates against the new dimensions.
+            // The cached blur has the previous viewport's size; clear the key
+            // so the next frame builds it again at the new size.
             self.cache_key = None;
         }
     }
 }
 
-/// Combine the caller's scene hash with the layout-affecting parameters that
-/// also invalidate the cached blur. Uses `DefaultHasher` (SipHash-1-3) - a few
-/// hundred ns; negligible vs. the bloom passes themselves.
-/// Upload `mask` (egui logical points, Y-down) to `prog`'s mask uniforms:
-/// rects as UV, keeps in physical pixels. The program must be in use.
+/// Hand egui back the GL state it expects.
+unsafe fn restore_gl_state(gl: &glow::Context) {
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.blend_func_separate(
+        glow::ONE,
+        glow::ONE_MINUS_SRC_ALPHA,
+        glow::ONE_MINUS_DST_ALPHA,
+        glow::ONE,
+    );
+    gl.use_program(None);
+    gl.bind_vertex_array(None);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+}
+
+/// Upload `mask`, given in egui logical points with Y down, to `prog`'s mask
+/// uniforms. Rects are sent as UV coordinates and keeps in physical pixels. The
+/// program must be in use.
 unsafe fn set_mask(
     gl: &glow::Context,
     prog: glow::Program,
@@ -505,7 +382,8 @@ unsafe fn set_mask(
     }
 }
 
-/// A rect in points as (x0, y0, x1, y1) in UV space, Y flipped for GL.
+/// Converts a rect in points to (x0, y0, x1, y1) in UV space, with Y flipped
+/// for GL.
 fn uv_rect(rect: &Rect, ppp: f32, w: i32, h: i32) -> [f32; 4] {
     [
         rect.min.x * ppp / w as f32,
@@ -515,14 +393,16 @@ fn uv_rect(rect: &Rect, ppp: f32, w: i32, h: i32) -> [f32; 4] {
     ]
 }
 
+/// Combine the caller's scene hash with the layout parameters that also
+/// invalidate the cached blur. `DefaultHasher` (SipHash-1-3) takes a few
+/// hundred nanoseconds, which is negligible next to the bloom passes.
 fn compose_key(scene_key: u64, w: i32, h: i32, ppp: f32, mask: &BloomMask) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h_ = std::collections::hash_map::DefaultHasher::new();
     scene_key.hash(&mut h_);
     w.hash(&mut h_);
     h.hash(&mut h_);
-    // ppp / Rect coords are floats - quantize to fixed-point so identical
-    // logical layouts hash identically.
+    // `ppp` and the rect coordinates are floats, so hash their bit patterns.
     (ppp.to_bits()).hash(&mut h_);
     for r in mask
         .excludes
@@ -548,7 +428,9 @@ fn compose_key(scene_key: u64, w: i32, h: i32, ppp: f32, mask: &BloomMask) -> u6
 // ── GL helpers ─────────────────────────────────────────────────────────────────
 
 unsafe fn make_fbo(gl: &glow::Context, w: i32, h: i32) -> (glow::Texture, glow::Framebuffer) {
-    let tex = gl.create_texture().expect("bloom tex");
+    let tex = gl
+        .create_texture()
+        .expect("could not create a bloom texture");
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
     gl.tex_image_2d(
         glow::TEXTURE_2D,
@@ -569,7 +451,9 @@ unsafe fn make_fbo(gl: &glow::Context, w: i32, h: i32) -> (glow::Texture, glow::
     ] {
         gl.tex_parameter_i32(glow::TEXTURE_2D, param, val);
     }
-    let fbo = gl.create_framebuffer().expect("bloom fbo");
+    let fbo = gl
+        .create_framebuffer()
+        .expect("could not create a bloom framebuffer");
     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
     gl.framebuffer_texture_2d(
         glow::FRAMEBUFFER,
@@ -589,7 +473,7 @@ unsafe fn compile_program(gl: &glow::Context, vert: &str, frag: &str) -> glow::P
     gl.compile_shader(vs);
     assert!(
         gl.get_shader_compile_status(vs),
-        "bloom vert: {}",
+        "the bloom vertex shader did not compile: {}",
         gl.get_shader_info_log(vs)
     );
 
@@ -598,7 +482,7 @@ unsafe fn compile_program(gl: &glow::Context, vert: &str, frag: &str) -> glow::P
     gl.compile_shader(fs);
     assert!(
         gl.get_shader_compile_status(fs),
-        "bloom frag: {}",
+        "the bloom fragment shader did not compile: {}",
         gl.get_shader_info_log(fs)
     );
 
@@ -608,7 +492,7 @@ unsafe fn compile_program(gl: &glow::Context, vert: &str, frag: &str) -> glow::P
     gl.link_program(prog);
     assert!(
         gl.get_program_link_status(prog),
-        "bloom link: {}",
+        "the bloom shader program did not link: {}",
         gl.get_program_info_log(prog)
     );
     gl.detach_shader(prog, vs);

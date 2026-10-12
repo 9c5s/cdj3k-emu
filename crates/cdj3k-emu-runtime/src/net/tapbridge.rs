@@ -35,21 +35,22 @@ fn tapbridge_base(instance_id: u32) -> String {
 /// The fixed macOS bridge interface shared with djx-emu so both emulators' TAPs
 /// land on the same L2 (DJ-Link). macOS bridges must be named `bridge<N>`;
 /// override with `DJPL_BRIDGE` (set identically in both apps). Both apps
-/// create-or-reuse this one bridge instead of an ephemeral `ifconfig bridge
-/// create`.
+/// create this bridge by name, or reuse it when it exists.
 fn djpl_bridge() -> String {
     std::env::var("DJPL_BRIDGE").unwrap_or_else(|_| "bridge99".to_string())
 }
 
-/// A live macOS bridge + QEMU TAP pair managed by an elevated watcher process,
+/// A macOS bridge and a QEMU TAP, managed by an elevated watcher process and
 /// torn down once this is dropped.
 pub struct TapBridge {
-    /// The macOS bridge interface created for this session (e.g. "bridge3").
+    /// The shared macOS bridge interface, such as "bridge99".
     pub bridge_iface: String,
-    /// The TAP interface name (e.g. "tap1") - informational; QEMU uses `qemu_tap_fd`.
+    /// The TAP interface name, such as "tap1". QEMU uses `qemu_tap_fd`, not
+    /// this name.
     pub qemu_tap: String,
-    /// Open fd for `/dev/<qemu_tap>`.  Passed to QEMU as `tap,fd=N` so the
-    /// interface is never DOWN between bridge setup and QEMU's first packet.
+    /// The open fd for `/dev/<qemu_tap>`. QEMU receives it as `tap,fd=N`, so
+    /// the interface is never DOWN between bridge setup and QEMU's first
+    /// packet.
     pub qemu_tap_fd: RawFd,
     /// Keeps the tap interface RUNNING until this struct is dropped.
     _tap_file: fs::File,
@@ -112,10 +113,11 @@ impl TapBridge {
         run_elevated(&cmd)?;
         lease.set_watched();
 
-        // Poll for the names file (watcher writes it after releasing the tap fd).
+        // Poll for the names file, which the watcher writes after it releases
+        // the tap fd.
         let (bridge_iface, qemu_tap) = wait_for_names(&names_file, Duration::from_secs(8))?;
 
-        // Open the tap device ourselves (watcher chmod'd it to 0666).
+        // Open the tap device here; the watcher has set its mode to 0666.
         // Holding this fd keeps the interface RUNNING in the bridge so there is
         // no DOWN/UP gap when QEMU starts; QEMU receives this fd directly via
         // `tap,fd=N` and never calls open() on /dev/tapN itself.
@@ -126,11 +128,11 @@ impl TapBridge {
             .open(&tap_dev)
             .map_err(|e| io::Error::new(e.kind(), format!("cannot open {tap_dev}: {e}")))?;
         let qemu_tap_fd = tap_file.as_raw_fd();
-        // Clear FD_CLOEXEC so the fd survives the fork+exec into --qemu-worker.
+        // Clear FD_CLOEXEC so the fd survives the fork and exec into --qemu-worker.
         unsafe { libc::fcntl(qemu_tap_fd, libc::F_SETFD, 0) };
 
         eprintln!(
-            "cdj3k-emu: tapbridge up  bridge={}  qemu_tap={}  fd={}  host_tap={}",
+            "cdj3k-emu: the TAP bridge is up: bridge {}, QEMU tap {} (fd {}), host tap {}.",
             bridge_iface, qemu_tap, qemu_tap_fd, host_tap
         );
 
@@ -148,7 +150,7 @@ impl Drop for TapBridge {
     /// Runs before the lease drops, which waits for the watcher's answer.
     fn drop(&mut self) {
         eprintln!(
-            "cdj3k-emu: tapbridge torn down  bridge={}  qemu_tap={}",
+            "cdj3k-emu: the TAP bridge is down: bridge {}, QEMU tap {}.",
             self.bridge_iface, self.qemu_tap
         );
     }
@@ -164,6 +166,7 @@ struct Watch<'a> {
     app_pid: u32,
 }
 
+/// Builds the watcher script: this run's variables, followed by [`WATCHER_BODY`].
 fn build_watcher_script(
     watch: &Watch,
     host_tap: &str,
@@ -172,18 +175,32 @@ fn build_watcher_script(
     script_self: &Path,
 ) -> String {
     format!(
-        r#"#!/bin/sh
-set -e
-CLAIM_FILE={claim_file}
-CLAIM={claim}
-RELEASED={released}
-HOST_TAP={host_tap}
-NAMES_FILE={names_file}
-APP_PID={app_pid}
-BRIDGE={bridge}
-held() {{ [ "$(cat "$CLAIM_FILE" 2>/dev/null)" = "$CLAIM" ] && kill -0 "$APP_PID" 2>/dev/null; }}
+        "#!/bin/sh\n\
+         set -e\n\
+         CLAIM_FILE={claim_file}\n\
+         CLAIM={claim}\n\
+         RELEASED={released}\n\
+         HOST_TAP={host_tap}\n\
+         NAMES_FILE={names_file}\n\
+         APP_PID={app_pid}\n\
+         BRIDGE={bridge}\n\
+         SCRIPT_SELF={script_self}\n\
+         {WATCHER_BODY}",
+        claim_file = sh_quote(&watch.claim_file.to_string_lossy()),
+        claim = sh_quote(watch.claim),
+        released = sh_quote(&watch.released.to_string_lossy()),
+        host_tap = sh_quote(host_tap),
+        names_file = sh_quote(&names_file.to_string_lossy()),
+        app_pid = watch.app_pid,
+        bridge = sh_quote(bridge),
+        script_self = sh_quote(&script_self.to_string_lossy()),
+    )
+}
 
-# tuntap kext: tap devices only appear in ifconfig after /dev/tapN is opened.
+/// What the watcher does, given the variables [`build_watcher_script`] sets.
+const WATCHER_BODY: &str = r#"held() { [ "$(cat "$CLAIM_FILE" 2>/dev/null)" = "$CLAIM" ] && kill -0 "$APP_PID" 2>/dev/null; }
+
+# With the tuntap kext, a tap device appears in ifconfig only after /dev/tapN is opened.
 # Claim the first free one by opening its device file on fd 3.
 TAP_QEMU=""
 for n in $(seq 0 15); do
@@ -199,12 +216,12 @@ for n in $(seq 0 15); do
         break
     fi
 done
-[ -z "$TAP_QEMU" ] && {{ echo "tapbridge: no free tap device found" >&2; exit 1; }}
+[ -z "$TAP_QEMU" ] && { echo "tapbridge: no tap device is free." >&2; exit 1; }
 
-# Create-or-reuse the SHARED fixed bridge (shared with djx-emu). If it already
-# exists (another emulator made it), reuse it; otherwise create it by name.
+# Create the fixed bridge shared with djx-emu, or reuse it if another emulator
+# already made it.
 ifconfig "$BRIDGE" >/dev/null 2>&1 || ifconfig "$BRIDGE" create >/dev/null 2>&1 \
-    || {{ echo "tapbridge: cannot create $BRIDGE" >&2; exit 1; }}
+    || { echo "tapbridge: the bridge $BRIDGE cannot be created." >&2; exit 1; }
 
 # Add the host tap to the shared bridge once (skip if already a member).
 if ! ifconfig "$BRIDGE" 2>/dev/null | grep -q "member: $HOST_TAP"; then
@@ -213,18 +230,17 @@ if ! ifconfig "$BRIDGE" 2>/dev/null | grep -q "member: $HOST_TAP"; then
 fi
 ifconfig "$BRIDGE" up               2>/dev/null || true
 
-# Open tap1 briefly: creates the interface, brings it up, sets permissions.
-# Then release so Rust can take exclusive hold and pass fd=N to QEMU.
-# (tuntap kext is exclusive - only one process can hold the fd at a time.)
+# Bring the claimed tap up, then close fd 3 so the app can open the device and
+# pass fd=N to QEMU. The tuntap kext lets only one process hold the device at a time.
 ifconfig "$TAP_QEMU" up             2>/dev/null || true
 exec 3>&-
 
 printf '%s:%s\n' "$BRIDGE" "$TAP_QEMU" > "$NAMES_FILE"
 
-# Phase 1: Poll until Rust/QEMU has opened the tap (it will become RUNNING),
-# then add it to the bridge with STP off.  The interface disappears when the
-# watcher releases it above and reappears when Rust opens it - we must add
-# the new instance, not the old one.
+# Phase 1: poll until the app has opened the tap and it shows RUNNING, then add
+# it to the bridge with STP off. The interface disappears when the watcher
+# closes fd 3 and reappears when the app opens it, so it is added only after
+# it reappears.
 DEADLINE=$(( $(date +%s) + 10 ))
 while held; do
     if ifconfig "$TAP_QEMU" 2>/dev/null | grep -q RUNNING; then
@@ -232,7 +248,7 @@ while held; do
         ifconfig "$BRIDGE" -stp "$TAP_QEMU" 2>/dev/null || true
         break
     fi
-    [ $(date +%s) -ge $DEADLINE ] && {{ echo "tapbridge: $TAP_QEMU never became RUNNING" >&2; break; }}
+    [ $(date +%s) -ge $DEADLINE ] && { echo "tapbridge: $TAP_QEMU never became RUNNING" >&2; break; }
     sleep 0.2
 done
 
@@ -241,46 +257,38 @@ while held; do
     sleep 0.5
 done
 
-# Tear down. The bridge is SHARED, so only remove OUR qemu tap; destroy the
-# bridge itself only when no other emulator's tap remains on it (last one out).
+# Tear down. The bridge is shared, so remove only this slot's QEMU tap, and
+# destroy the bridge only when no other emulator's tap remains on it.
 chmod 0600 "/dev/$TAP_QEMU" 2>/dev/null || true
 ifconfig "$BRIDGE"   deletem "$TAP_QEMU" 2>/dev/null || true
 ifconfig "$TAP_QEMU" down    2>/dev/null || true
-REMAIN=$(ifconfig "$BRIDGE" 2>/dev/null | awk '/member: tap/ {{print $2}}' | grep -v "^$HOST_TAP$" | grep -c . || true)
+REMAIN=$(ifconfig "$BRIDGE" 2>/dev/null | awk '/member: tap/ {print $2}' | grep -v "^$HOST_TAP$" | grep -c . || true)
 if [ "$REMAIN" = "0" ]; then
     ifconfig "$BRIDGE" deletem "$HOST_TAP" 2>/dev/null || true
     ifconfig "$BRIDGE" destroy 2>/dev/null || true
 fi
-rm -f "$NAMES_FILE" {script_self}
+rm -f "$NAMES_FILE" "$SCRIPT_SELF"
 printf '%s' "$CLAIM" > "$RELEASED"
-"#,
-        claim_file = sh_quote(&watch.claim_file.to_string_lossy()),
-        claim = sh_quote(watch.claim),
-        released = sh_quote(&watch.released.to_string_lossy()),
-        host_tap = sh_quote(host_tap),
-        names_file = sh_quote(&names_file.to_string_lossy()),
-        app_pid = watch.app_pid,
-        bridge = sh_quote(bridge),
-        script_self = sh_quote(&script_self.to_string_lossy()),
-    )
+"#;
+
+/// The `<bridge>:<tap>` pair the watcher wrote to `names_file`, when it has.
+fn read_names(names_file: &Path) -> Option<(String, String)> {
+    let content = fs::read_to_string(names_file).ok()?;
+    let (bridge, tap) = content.trim().split_once(':')?;
+    (!bridge.is_empty() && !tap.is_empty()).then(|| (bridge.to_string(), tap.to_string()))
 }
 
 fn wait_for_names(names_file: &Path, timeout: Duration) -> io::Result<(String, String)> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(content) = fs::read_to_string(names_file) {
-            let content = content.trim();
-            if let Some((bridge, tap)) = content.split_once(':') {
-                if !bridge.is_empty() && !tap.is_empty() {
-                    return Ok((bridge.to_string(), tap.to_string()));
-                }
-            }
+        if let Some(names) = read_names(names_file) {
+            return Ok(names);
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "tapbridge watcher did not report interface names within {}s",
+                    "the tapbridge watcher did not report the interface names within {} s",
                     timeout.as_secs(),
                 ),
             ));
@@ -295,35 +303,44 @@ fn wait_for_names(names_file: &Path, timeout: Duration) -> io::Result<(String, S
 /// and destroy them via a single elevated call.
 fn cleanup_stale(instance_id: u32) {
     let names_file = PathBuf::from(format!("{}.names", tapbridge_base(instance_id)));
-    let Ok(content) = fs::read_to_string(&names_file) else {
+    let Some((bridge, tap)) = read_names(&names_file) else {
         return;
     };
-    let content = content.trim();
-    let Some((bridge, tap)) = content.split_once(':') else {
-        return;
-    };
-    if bridge.is_empty() || tap.is_empty() {
-        return;
-    }
 
     eprintln!(
-        "cdj3k-emu: cleaning up stale tapbridge  bridge={}  tap={}",
+        "cdj3k-emu: removing a stale tapbridge (bridge={}, tap={})",
         bridge, tap
     );
 
     let cmd = format!(
         "ifconfig {br} deletem {tap} 2>/dev/null; ifconfig {tap} destroy 2>/dev/null; rm -f {nf}",
-        br = sh_quote(bridge),
-        tap = sh_quote(tap),
+        br = sh_quote(&bridge),
+        tap = sh_quote(&tap),
         nf = sh_quote(&names_file.to_string_lossy()),
     );
-    // Best-effort - ignore elevation cancellation.
+    // This is best-effort: a cancelled elevation prompt is ignored.
     let _ = run_elevated(&cmd);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A names file counts once it holds both names.
+    #[test]
+    fn names_need_both_halves() {
+        let path =
+            std::env::temp_dir().join(format!("cdj3k-emu-tapbridge-names-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        assert_eq!(read_names(&path), None);
+        for partial in ["bridge99", "bridge99:", ":tap1", "\n"] {
+            fs::write(&path, partial).unwrap();
+            assert_eq!(read_names(&path), None, "{partial:?}");
+        }
+        fs::write(&path, "bridge99:tap1\n").unwrap();
+        assert_eq!(read_names(&path), Some(("bridge99".into(), "tap1".into())));
+        let _ = fs::remove_file(&path);
+    }
 
     /// The watcher holds the link while the claim is the slot's and the app
     /// lives, and answers the lease only after the teardown.

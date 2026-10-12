@@ -140,17 +140,18 @@ mod x11 {
 
     use super::{already_applied, mark_applied, Ratio};
 
-    /// A connection of our own: winit's is not reachable through eframe. The
-    /// hints are a property on the window, so whose connection sets them does
-    /// not matter.
+    /// This module opens its own connection, because winit's is not reachable
+    /// through eframe. The hints are a property on the window, so any
+    /// connection can set them.
     fn conn() -> Option<&'static RustConnection> {
         static CONN: OnceLock<Option<RustConnection>> = OnceLock::new();
         CONN.get_or_init(|| RustConnection::connect(None).ok().map(|(c, _)| c))
             .as_ref()
     }
 
-    /// Minimum and maximum aspect set equal, with the strip as the base size:
-    /// ICCCM applies the aspect to the size minus the base. The existing hints
+    /// Set the minimum and maximum aspect to the same ratio, with the strip as
+    /// the base size, because ICCCM applies the aspect to the size minus the
+    /// base. The existing hints
     /// are read first and kept, since winit writes the min and max sizes into
     /// the same property.
     pub(super) fn hold(window: u32, ratio: Option<Ratio>) {
@@ -249,8 +250,8 @@ mod tests {
         }
     }
 
-    /// A fitted size fits as itself: refitting it on every configure must not
-    /// shave a pixel off each time.
+    /// Fitting an already fitted size returns it unchanged, so refitting on
+    /// every configure does not shave off a pixel each time.
     #[test]
     fn fitting_twice_changes_nothing() {
         for w in (120..2000).step_by(29) {
@@ -261,7 +262,8 @@ mod tests {
         }
     }
 
-    /// Nothing to fit into, or nothing to fit: the offer stands.
+    /// A size no taller than the strip, or a ratio with a zero side, is
+    /// returned unchanged.
     #[test]
     fn degenerate_input_is_left_alone() {
         assert_eq!(fit(500, 44), LogicalSize::new(500, 44));

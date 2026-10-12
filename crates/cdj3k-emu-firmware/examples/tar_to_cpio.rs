@@ -1,8 +1,8 @@
 //! Turn the tar the guest handed back into the initramfs the emulator boots.
 //!
-//! The guest packs as tar because busybox's cpio is extract-only. tar carries
-//! everything a cpio header needs — mode, uid/gid, symlink targets, device
-//! nodes — so nothing is lost in the crossing.
+//! The guest packs a tar because busybox's cpio can only extract. tar carries
+//! everything a cpio header needs (the mode, uid and gid, symlink targets and
+//! device nodes), so the conversion loses nothing.
 //!
 //! Usage: <handback.tar> <out.cpio.gz>
 
@@ -21,62 +21,25 @@ fn main() {
         std::process::exit(2);
     };
 
-    let mut archive = tar::Archive::new(std::fs::File::open(tar_path).expect("open tar"));
+    let mut archive =
+        tar::Archive::new(std::fs::File::open(tar_path).expect("the tar file should open"));
     let mut entries: Vec<Entry> = Vec::new();
     let mut skipped = 0usize;
-    // Content of every regular file seen so far, so a hard link becomes a
-    // full copy: this codec has no ino/nlink model to express one.
+    // The content of every regular file seen so far. A hard link becomes a
+    // full copy, because the cpio codec has no inode or link count.
     let mut seen: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
-    for e in archive.entries().expect("tar entries") {
-        let mut e = e.expect("tar entry");
+    for e in archive.entries().expect("the tar entries should be listed") {
+        let mut e = e.expect("the tar entry should be readable");
         let header = e.header().clone();
         let path = format!("/{}", e.path().expect("path").to_string_lossy());
         let path = path.replace("/./", "/");
         let mode = header.mode().unwrap_or(0o644) & 0o7777;
 
-        let kind = match header.entry_type() {
-            EntryType::Regular | EntryType::Continuous => {
-                let mut data = Vec::new();
-                e.read_to_end(&mut data).expect("read");
-                seen.insert(path.clone(), data.clone());
-                Kind::File(data)
-            }
-            EntryType::Link => {
-                let target = header
-                    .link_name()
-                    .ok()
-                    .flatten()
-                    .map(|p| format!("/{}", p.to_string_lossy()).replace("/./", "/"))
-                    .unwrap_or_default();
-                match seen.get(&target) {
-                    Some(data) => Kind::File(data.clone()),
-                    None => {
-                        eprintln!("  hard link {path} -> {target}: target not seen, skipping");
-                        skipped += 1;
-                        continue;
-                    }
-                }
-            }
-            EntryType::Directory => Kind::Dir,
-            EntryType::Symlink => Kind::Symlink(
-                header
-                    .link_name()
-                    .ok()
-                    .flatten()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ),
-            EntryType::Char => Kind::CharDev {
-                major: header.device_major().ok().flatten().unwrap_or(0),
-                minor: header.device_minor().ok().flatten().unwrap_or(0),
-            },
-            _ => {
-                skipped += 1;
-                continue;
-            }
+        let Some(kind) = entry_kind(&mut e, &header, &path, &mut seen) else {
+            skipped += 1;
+            continue;
         };
-
         entries.push(Entry {
             path: path.into(),
             kind,
@@ -96,4 +59,47 @@ fn main() {
     enc.write_all(&raw).expect("gzip");
     enc.finish().expect("finish");
     println!("wrote {out_path}");
+}
+
+/// Returns the cpio kind for a tar entry, or `None` when the entry is skipped.
+fn entry_kind<R: Read>(
+    e: &mut tar::Entry<R>,
+    header: &tar::Header,
+    path: &str,
+    seen: &mut BTreeMap<String, Vec<u8>>,
+) -> Option<Kind> {
+    let link_name = || {
+        header
+            .link_name()
+            .ok()
+            .flatten()
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    match header.entry_type() {
+        EntryType::Regular | EntryType::Continuous => {
+            let mut data = Vec::new();
+            e.read_to_end(&mut data).expect("read");
+            seen.insert(path.to_string(), data.clone());
+            Some(Kind::File(data))
+        }
+        EntryType::Link => {
+            let target = link_name()
+                .map(|p| format!("/{p}").replace("/./", "/"))
+                .unwrap_or_default();
+            let data = seen.get(&target);
+            if data.is_none() {
+                eprintln!(
+                    "  Skipping the hard link {path}: its target {target} has not been seen."
+                );
+            }
+            data.map(|d| Kind::File(d.clone()))
+        }
+        EntryType::Directory => Some(Kind::Dir),
+        EntryType::Symlink => Some(Kind::Symlink(link_name().unwrap_or_default())),
+        EntryType::Char => Some(Kind::CharDev {
+            major: header.device_major().ok().flatten().unwrap_or(0),
+            minor: header.device_minor().ok().flatten().unwrap_or(0),
+        }),
+        _ => None,
+    }
 }

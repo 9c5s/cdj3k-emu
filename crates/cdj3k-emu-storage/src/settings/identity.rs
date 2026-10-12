@@ -1,10 +1,10 @@
 //! The two values that identify a slot to the guest: its MAC and the SoC
-//! serial the deck's `genkey_pr` keys `cabinet.img` with. Minting and
-//! validation only - [`super::InstanceSettings`] owns the persistence.
+//! serial the deck's `genkey_pr` keys `cabinet.img` with. This module only
+//! mints and validates them; [`super::InstanceSettings`] stores them.
 
-/// 16 lowercase hex digits with a non-zero last byte, matching what an RK3399
-/// prints for `Serial`.  `genkey_pr` repeats its hash input
-/// `strtol(&serial[14..], 16)` times, so a zero there would hash nothing.
+/// Whether `s` has 16 lowercase hex digits and a non-zero last byte.
+/// `genkey_pr` hashes its input N + 1 times, where N is the last byte, so it
+/// also accepts a zero last byte.
 pub(super) fn is_valid_soc_serial(s: &str) -> bool {
     s.len() == 16
         && s.bytes()
@@ -12,8 +12,8 @@ pub(super) fn is_valid_soc_serial(s: &str) -> bool {
         && matches!(u8::from_str_radix(&s[14..], 16), Ok(n) if n != 0)
 }
 
-/// Mint a SoC serial from a v4 UUID's first 8 bytes, forcing the last byte
-/// non-zero so `genkey_pr`'s repeat count is at least 1.
+/// Mint a SoC serial from a v4 UUID's first 8 bytes, with the last byte forced
+/// non-zero so that the serial passes [`is_valid_soc_serial`].
 pub(super) fn generate_soc_serial() -> String {
     let b = uuid::Uuid::new_v4().into_bytes();
     format!(
@@ -29,10 +29,11 @@ pub(super) fn generate_soc_serial() -> String {
     )
 }
 
-/// Generate a random locally-administered unicast MAC.
-/// Uses `uuid::Uuid::new_v4()` (already a dep) as the entropy source - its bytes
-/// are cryptographically random on macOS/Linux. The first byte is forced to
-/// `02` (LAA bit set, multicast bit clear) so it's a valid host address.
+/// Generate a random locally administered unicast MAC.
+///
+/// The bytes come from a v4 UUID, whose bytes are cryptographically random.
+/// The first byte gets the LAA bit set and the multicast bit cleared, so the
+/// address is a valid host address.
 pub(super) fn generate_mac() -> String {
     let bytes = uuid::Uuid::new_v4().into_bytes();
     let m0 = (bytes[0] & 0xfe) | 0x02; // LAA, unicast
@@ -46,11 +47,10 @@ pub(super) fn generate_mac() -> String {
 mod tests {
     use super::*;
 
-    /// What `genkey_pr` can use, and what a mint therefore has to produce.
+    /// A minted serial and MAC always pass their validators.
     #[test]
     fn a_mint_always_passes_its_own_validator() {
         assert!(is_valid_soc_serial("0123456789abcd05"));
-        // Last byte zero: genkey_pr would repeat its hash input zero times.
         assert!(!is_valid_soc_serial("0123456789abcd00"));
         assert!(!is_valid_soc_serial("deadbeef"), "too short");
         assert!(!is_valid_soc_serial("zzzzzzzzzzzzzzzz"), "not hex");

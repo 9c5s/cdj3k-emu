@@ -7,7 +7,7 @@
 //!
 //! # Which shape, and why
 //!
-//! The kernel's classification of the interface picked decides:
+//! The kernel's classification of the selected interface decides the shape:
 //!
 //! * **a tap** — attached as it is. Nothing is created, and nothing is
 //!   elevated when the user can open it.
@@ -16,8 +16,9 @@
 //!   guest its own MAC on the LAN without moving the host's address onto a
 //!   bridge.
 //!
-//! A macvtap cannot reach its own parent's host: rekordbox on this machine
-//! does not see the deck. A bridge built by hand and picked does.
+//! A macvtap cannot reach the host of its parent interface, so rekordbox on
+//! this machine does not see the deck. It does see the deck through a bridge
+//! that the user built and selected.
 //!
 //! # Lifetime
 //!
@@ -68,8 +69,8 @@ impl Shape {
     }
 }
 
-/// The guest's link for one instance, deleted once this is dropped (module
-/// doc, Lifetime).
+/// The guest's link for one instance, deleted once this is dropped (see
+/// Lifetime in the module doc).
 pub struct LinuxBridge {
     /// The interface QEMU is attached through — ours, or the user's own tap.
     pub iface: String,
@@ -139,7 +140,7 @@ impl LinuxBridge {
         let mut bridge = Self::open(shape, &ours, &node)?;
         bridge.lease = Some(lease);
         eprintln!(
-            "cdj3k-emu: {shape:?} up on {iface}  iface={ours}  fd={}",
+            "cdj3k-emu: the {shape:?} link {ours} is up on {iface} (fd {}).",
             bridge.fd
         );
         Ok(bridge)
@@ -159,7 +160,7 @@ impl LinuxBridge {
         if shape == Shape::TapOnBridge {
             attach_tun(fd, ours)?;
         }
-        // Cleared so the fd survives the fork+exec into QEMU.
+        // Clear FD_CLOEXEC so the fd survives the fork and exec into QEMU.
         unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
         Ok(Self {
             iface: ours.to_string(),
@@ -186,7 +187,7 @@ impl LinuxBridge {
         attach_tun(file.as_raw_fd(), iface)?;
         let fd = file.as_raw_fd();
         unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
-        eprintln!("cdj3k-emu: attached to existing tap {iface}  fd={fd}");
+        eprintln!("cdj3k-emu: the guest is attached to the existing tap {iface} (fd {fd}).");
         Ok(Self {
             iface: iface.to_string(),
             shape: Shape::ExistingTap,
@@ -208,7 +209,7 @@ fn attach_tun(fd: RawFd, iface: &str) -> io::Result<()> {
     if name.len() >= 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "interface name too long",
+            "the interface name is too long",
         ));
     }
     req[..name.len()].copy_from_slice(name);
@@ -226,8 +227,9 @@ fn attach_tun(fd: RawFd, iface: &str) -> io::Result<()> {
 
 /// The name of the interface we create for an instance.
 ///
-/// Kept inside IFNAMSIZ (15 usable characters) and stamped with the slot, so
-/// two slots on one machine cannot collide and a leftover is identifiable.
+/// The name fits in IFNAMSIZ (15 usable characters) and carries the slot
+/// number, so two slots on one machine cannot collide and a leftover
+/// interface shows which slot made it.
 fn our_iface_name(instance_id: u32) -> String {
     format!("cdj3k{instance_id}")
 }

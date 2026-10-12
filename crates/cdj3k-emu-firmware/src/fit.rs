@@ -1,10 +1,10 @@
 //! Flattened Image Tree (U-Boot FIT) reader.
 //!
-//! Models that ship `images/boot.img` as a FIT with external data: a small
-//! device tree describes `/images/{fdt,kernel,ramdisk,resource}`, each with a
-//! `data-position` (or `data-offset`) and `data-size` into the file and a
-//! SHA-256 `hash` node. [`image`] returns one of those payloads, its hash
-//! checked.
+//! Some models ship `images/boot.img` as a FIT with external data. A small
+//! device tree describes `/images/{fdt,kernel,ramdisk,resource}`; each image
+//! has a `data-position` (or `data-offset`), a `data-size` and a SHA-256
+//! `hash` node. [`image`] returns one of those payloads after checking its
+//! hash.
 
 use sha2::{Digest, Sha256};
 
@@ -88,14 +88,16 @@ impl<'a> Tree<'a> {
         let header = |at: usize| {
             word(at)
                 .map(|w| w as usize)
-                .ok_or(ExtractError::BadIso("truncated FDT header"))
+                .ok_or(ExtractError::BadIso("the FDT header is truncated"))
         };
         let total_size = header(4)?;
         let struct_off = header(8)?;
         let strings_off = header(12)?;
-        let strings = fit
-            .get(strings_off..total_size.min(fit.len()))
-            .ok_or(ExtractError::BadIso("FDT strings block out of range"))?;
+        let strings =
+            fit.get(strings_off..total_size.min(fit.len()))
+                .ok_or(ExtractError::BadIso(
+                    "the FDT strings block is out of range",
+                ))?;
         let cstr = |b: &'a [u8]| -> &'a str {
             let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
             std::str::from_utf8(&b[..end]).unwrap_or("")
@@ -134,7 +136,7 @@ impl<'a> Tree<'a> {
                 }
                 FDT_NOP => {}
                 FDT_END => break,
-                _ => return Err(ExtractError::BadIso("unknown FDT token")),
+                _ => return Err(ExtractError::BadIso("the FDT has an unknown token")),
             }
         }
         Ok(Self { total_size, props })
@@ -164,8 +166,8 @@ impl<'a> Tree<'a> {
 mod tests {
     use super::*;
 
-    /// A FIT with external data: `/images/ramdisk` at `data-position`, hashed.
-    /// The hash node is named `hash_node`; empty, there is none.
+    /// Builds a FIT with external data that holds a hashed `/images/ramdisk`.
+    /// The hash node is named `hash_node`; an empty name leaves it out.
     fn fit_with(payload: &[u8], hash: [u8; 32], offset_style: bool, hash_node: &str) -> Vec<u8> {
         let mut strings = Vec::new();
         let mut name = |s: &str| {

@@ -1,8 +1,8 @@
-//! MISO frame synthesis and per-channel inject helpers.
+//! Builds MISO frames and injects them for each control.
 //!
-//! Every state-changing path on `CdjApp` calls [`CdjApp::inject`] with a
-//! freshly-built frame from [`CdjApp::build_current_frame`], so every frame
-//! carries the held buttons. The frame is the player's own encoding of
+//! Every path on `CdjApp` that changes state calls [`CdjApp::inject`] with a
+//! new frame from [`CdjApp::build_current_frame`], so every frame carries the
+//! held buttons. The frame is the player's own encoding of
 //! [`CdjApp::panel_state`].
 
 use cdj3k_emu_panel::miso_frame::{self, JogState, PanelState};
@@ -17,7 +17,8 @@ impl CdjApp {
         self.ctrl_stream.inject(&frame_bytes);
     }
 
-    /// The full current control state, in no deck's coordinates.
+    /// The full current control state. The button bits are already in the
+    /// player's frame; the player's encoder places the analog fields.
     pub(super) fn panel_state(&self) -> PanelState {
         PanelState {
             pressed: self
@@ -48,20 +49,20 @@ impl CdjApp {
         }
     }
 
-    /// The MISO frame for the full current control state. All inject paths
-    /// build their frame here.
+    /// The MISO frame for the full current control state. Every inject path
+    /// builds its frame here.
     pub(super) fn build_current_frame(&self) -> [u8; miso_frame::MISO_SIZE] {
-        miso_frame::encode(self.model, &self.panel_state())
+        self.model.encode(&self.panel_state())
     }
 
-    /// The current control state with the power flag dropped: the frame the
-    /// guest reads as power off.
+    /// The current control state with the power flag cleared, which the guest
+    /// reads as power off.
     pub(super) fn power_off_frame(&self) -> [u8; miso_frame::MISO_SIZE] {
         let state = PanelState {
             power: false,
             ..self.panel_state()
         };
-        miso_frame::encode(self.model, &state)
+        self.model.encode(&state)
     }
 
     pub(super) fn inject_jog(&mut self) {
@@ -78,12 +79,13 @@ impl CdjApp {
 
     /// The latest LED frame, read through the map of the player on screen.
     pub(crate) fn mosi(&self) -> MosiFrame {
-        MosiFrame::new(self.led_state.frame, self.model)
+        self.model.mosi_frame(self.led_state.frame)
     }
 
-    /// A button by written name (see [`miso_frame::button_by_name`]).
+    /// Looks up a button by its written name (see
+    /// [`Model::button_by_name`](cdj3k_emu_panel::Model::button_by_name)).
     pub(super) fn btn_by_name(&self, name: &str) -> Option<(usize, u8)> {
-        miso_frame::button_by_name(self.model, name)
+        self.model.button_by_name(name)
     }
 
     /// Force `bit` low in every frame (`on`) or stop doing so, and inject.

@@ -2,7 +2,7 @@
 
 use std::io;
 
-use super::kv::{app_path, locked, read_kv, write_kv, APP_KEYS};
+use super::kv::{app_path, flag, flag_value, locked, read_kv, text, write_kv, APP_KEYS};
 
 /// What the updater remembers between launches. Stored in the app-wide
 /// `settings.txt`.
@@ -14,11 +14,12 @@ pub struct AppSettings {
     /// A release the user chose to skip. The automatic check offers only a
     /// newer one; a check from the menu offers it still.
     pub update_skip_version: Option<String>,
-    /// Unix time before which the automatic check stays quiet: set by "Remind
-    /// Me Later". 0 for none.
+    /// The Unix time before which the automatic check stays quiet, set by
+    /// "Remind Me Later". It is 0 when no reminder is set.
     pub update_remind_after: u64,
     /// Download and prepare what the automatic check finds without asking,
-    /// then offer the restart. Off by default. macOS keeps Sparkle's own.
+    /// then offer the restart. Off by default. On macOS, Sparkle's own setting
+    /// applies instead.
     pub update_auto_install: bool,
 }
 
@@ -43,22 +44,13 @@ impl AppSettings {
         let map = read_kv(&app_path());
         let d = Self::default();
         Self {
-            update_auto_check: map
-                .get("update_auto_check")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(d.update_auto_check),
-            update_skip_version: map
-                .get("update_skip_version")
-                .filter(|v| !v.is_empty())
-                .cloned(),
+            update_auto_check: flag(&map, "update_auto_check", d.update_auto_check),
+            update_skip_version: text(&map, "update_skip_version"),
             update_remind_after: map
                 .get("update_remind_after")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.update_remind_after),
-            update_auto_install: map
-                .get("update_auto_install")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(d.update_auto_install),
+            update_auto_install: flag(&map, "update_auto_install", d.update_auto_install),
         }
     }
 
@@ -69,10 +61,7 @@ impl AppSettings {
         mutate(&mut s);
         let path = app_path();
         let mut map = read_kv(&path);
-        map.insert(
-            "update_auto_check".into(),
-            if s.update_auto_check { "1" } else { "0" }.into(),
-        );
+        map.insert("update_auto_check".into(), flag_value(s.update_auto_check));
         map.insert(
             "update_skip_version".into(),
             s.update_skip_version.unwrap_or_default(),
@@ -83,7 +72,7 @@ impl AppSettings {
         );
         map.insert(
             "update_auto_install".into(),
-            if s.update_auto_install { "1" } else { "0" }.into(),
+            flag_value(s.update_auto_install),
         );
         write_kv(&path, &map, APP_KEYS)
     }
@@ -93,7 +82,7 @@ impl AppSettings {
 mod tests {
     use super::*;
 
-    /// Both keys survive their own save and the startup prune.
+    /// Every key survives its own save and the startup prune.
     #[test]
     fn app_settings_round_trip_through_the_prune() {
         let _home = crate::TestHome::new("appsettings");

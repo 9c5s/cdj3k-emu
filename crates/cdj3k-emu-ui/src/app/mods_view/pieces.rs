@@ -2,7 +2,37 @@
 
 use super::*;
 
-/// The footer bar, without the app version at its left end.
+// ── Text in a row ─────────────────────────────────────────────────────────────
+pub(super) const NAME_FONT: f32 = 13.5;
+pub(super) const MONO_FONT: f32 = 10.5;
+const LINE_GAP: f32 = 3.0;
+pub(super) const STATUS_FONT: f32 = 9.0;
+pub(super) const STATUS_TRACK: f32 = 1.26;
+/// The font size of a note line and of a mod's author.
+pub(super) const NOTE_FONT: f32 = 12.0;
+const CHIP_H: f32 = 16.0;
+const CHIP_PAD: f32 = 5.0;
+const CHIP_FONT: f32 = 8.5;
+const CHIP_TRACK: f32 = 1.2;
+
+// ── Buttons ───────────────────────────────────────────────────────────────────
+const TOOL_PAD: f32 = 14.0;
+const TOOL_GLYPH: f32 = 11.0;
+const TOOL_GLYPH_GAP: f32 = 7.0;
+const ACTION_GLYPH: f32 = 14.0;
+/// The width of Back and of the dialogs' buttons.
+pub(super) const BACK_W: f32 = 100.0;
+/// The room on both sides of the label of a button sized to its text.
+pub(super) const COPY_PAD: f32 = 32.0;
+
+// ── Dashes and links ──────────────────────────────────────────────────────────
+const DASH: f32 = 4.0;
+const DASH_GAP: f32 = 3.0;
+const LINK_FONT: f32 = 13.0;
+const LINK_GLYPH: f32 = 14.0;
+pub(super) const LINKS_H: f32 = 20.0;
+
+/// Draws the footer bar without the app version at its left end.
 pub(super) fn plain_footer(ui: &egui::Ui, bar: Rect, k: f32, pal: &Palette) -> Rect {
     let p = ui.painter();
     p.rect_filled(bar, 0.0, pal.plate);
@@ -76,7 +106,8 @@ pub(super) fn chip_width(p: &egui::Painter, text: &str, k: f32) -> f32 {
     ) + 2.0 * CHIP_PAD * k
 }
 
-/// `BUILT-IN`, `DEV`: a word in a hairline box, left edge at `x`.
+/// Draws a word such as `BUILT-IN` or `DEV` in a hairline box whose left
+/// edge is at `x`.
 pub(super) fn chip(p: &egui::Painter, x: f32, cy: f32, text: &str, k: f32, pal: &Palette) {
     let w = chip_width(p, text, k);
     let rect = Rect::from_min_size(
@@ -99,7 +130,7 @@ pub(super) fn chip(p: &egui::Painter, x: f32, cy: f32, text: &str, k: f32, pal: 
     );
 }
 
-/// `text` cut to `max` with an ellipsis.
+/// Returns `text` cut to the width `max`, with an ellipsis.
 pub(super) fn elide(p: &egui::Painter, text: &str, font: &FontId, max: f32) -> String {
     if text_width(p, text, font, 0.0) <= max {
         return text.to_owned();
@@ -115,7 +146,7 @@ pub(super) fn elide(p: &egui::Painter, text: &str, font: &FontId, max: f32) -> S
     "…".into()
 }
 
-/// [`elide`] from the front: a path or a URL keeps its end.
+/// Like [`elide`], but cuts from the front, so a path or a URL keeps its end.
 pub(super) fn elide_start(p: &egui::Painter, text: &str, font: &FontId, max: f32) -> String {
     if text_width(p, text, font, 0.0) <= max {
         return text.to_owned();
@@ -165,7 +196,8 @@ pub(super) fn tool_width(p: &egui::Painter, label: &str, plus: bool, k: f32) -> 
     w
 }
 
-/// A toolbar button, right edge at `right`: outlined, or filled with ink.
+/// Draws a toolbar button with its right edge at `right`, either outlined or
+/// filled with ink.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tool_button(
     ui: &egui::Ui,
@@ -252,8 +284,9 @@ pub(super) fn glyph_button(
     resp
 }
 
-/// A link out of the app: glyph, label, underlined under the pointer. `at`
-/// is its left end, centred on the line.
+/// Draws a link that opens outside the app: a glyph and a label, underlined
+/// while the pointer is over it. `at` is its left end, centred vertically on
+/// the line.
 pub(super) fn link(
     ui: &egui::Ui,
     at: Pos2,
@@ -306,132 +339,6 @@ pub(in crate::app) fn dashed_rect(p: &egui::Painter, r: Rect, col: Color32, k: f
         r.left_top(),
     ];
     p.extend(Shape::dashed_line(&pts, stroke, DASH * k, DASH_GAP * k));
-}
-
-/// The mods icon, a cube, used by the Mods bar and the replace warning.
-pub(in crate::app) fn cube_glyph(p: &egui::Painter, rect: Rect, col: Color32, k: f32) {
-    glyph(p, Glyph::Cube, rect, col, k);
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum Glyph {
-    Doc,
-    Eject,
-    Trash,
-    Plus,
-    Lock,
-    Warn,
-    Handle,
-    Cube,
-    Folder,
-}
-
-/// Paint `g` into `rect`, drawn on a 14-unit grid (the cube on 28).
-pub(super) fn glyph(p: &egui::Painter, g: Glyph, rect: Rect, col: Color32, k: f32) {
-    let grid = if matches!(g, Glyph::Cube) { 28.0 } else { 14.0 };
-    let s = rect.width().min(rect.height()) / grid;
-    let o = rect.center() - Vec2::splat(grid * 0.5 * s);
-    let pt = |x: f32, y: f32| Pos2::new(o.x + x * s, o.y + y * s);
-    let stroke = Stroke::new(1.1 * k, col);
-    let poly = |pts: &[(f32, f32)], closed: bool| {
-        let v: Vec<Pos2> = pts.iter().map(|&(x, y)| pt(x, y)).collect();
-        if closed {
-            p.add(Shape::closed_line(v, stroke));
-        } else {
-            p.add(Shape::line(v, stroke));
-        }
-    };
-    match g {
-        Glyph::Doc => {
-            poly(
-                &[
-                    (3.0, 1.8),
-                    (8.4, 1.8),
-                    (11.0, 4.4),
-                    (11.0, 12.2),
-                    (3.0, 12.2),
-                ],
-                true,
-            );
-            poly(&[(8.2, 1.8), (8.2, 4.6), (11.0, 4.6)], false);
-            poly(&[(5.0, 7.0), (9.0, 7.0)], false);
-            poly(&[(5.0, 9.4), (9.0, 9.4)], false);
-        }
-        Glyph::Eject => {
-            poly(&[(7.0, 2.4), (12.0, 8.2), (2.0, 8.2)], true);
-            poly(&[(2.2, 11.2), (11.8, 11.2)], false);
-        }
-        Glyph::Trash => trash_glyph(p, rect.shrink(rect.width() * 0.05), col, k),
-        Glyph::Plus => {
-            poly(&[(7.0, 1.5), (7.0, 12.5)], false);
-            poly(&[(1.5, 7.0), (12.5, 7.0)], false);
-        }
-        Glyph::Lock => {
-            poly(&[(2.5, 6.0), (11.5, 6.0), (11.5, 12.5), (2.5, 12.5)], true);
-            let arc: Vec<(f32, f32)> = (0..=12)
-                .map(|i| {
-                    let a = std::f32::consts::PI * (i as f32 / 12.0);
-                    (7.0 - 2.5 * a.cos(), 4.3 - 2.5 * a.sin())
-                })
-                .collect();
-            let mut shackle = vec![(4.5, 6.0)];
-            shackle.extend(arc);
-            shackle.push((9.5, 6.0));
-            poly(&shackle, false);
-        }
-        Glyph::Warn => {
-            poly(&[(7.0, 1.4), (13.3, 12.6), (0.7, 12.6)], true);
-            p.line_segment([pt(7.0, 5.4), pt(7.0, 8.8)], Stroke::new(1.3 * k, col));
-            p.circle_filled(pt(7.0, 10.6), 0.8 * s, col);
-        }
-        Glyph::Handle => {
-            for (x, y) in [
-                (5.0, 3.0),
-                (9.0, 3.0),
-                (5.0, 7.0),
-                (9.0, 7.0),
-                (5.0, 11.0),
-                (9.0, 11.0),
-            ] {
-                p.circle_filled(pt(x, y), 1.1 * s, col);
-            }
-        }
-        Glyph::Cube => {
-            let stroke = Stroke::new(1.3 * k, col);
-            let v = |pts: &[(f32, f32)]| pts.iter().map(|&(x, y)| pt(x, y)).collect::<Vec<_>>();
-            p.add(Shape::closed_line(
-                v(&[
-                    (4.0, 9.5),
-                    (14.0, 4.0),
-                    (24.0, 9.5),
-                    (24.0, 18.5),
-                    (14.0, 24.0),
-                    (4.0, 18.5),
-                ]),
-                stroke,
-            ));
-            p.add(Shape::line(
-                v(&[(4.0, 9.5), (14.0, 15.0), (24.0, 9.5)]),
-                stroke,
-            ));
-            p.add(Shape::line(v(&[(14.0, 15.0), (14.0, 24.0)]), stroke));
-        }
-        Glyph::Folder => {
-            poly(
-                &[
-                    (2.0, 3.2),
-                    (6.0, 3.2),
-                    (7.2, 4.6),
-                    (12.0, 4.6),
-                    (12.0, 11.2),
-                    (2.0, 11.2),
-                ],
-                true,
-            );
-            poly(&[(7.0, 6.6), (7.0, 9.6)], false);
-            poly(&[(5.5, 8.1), (8.5, 8.1)], false);
-        }
-    }
 }
 
 pub(super) fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {

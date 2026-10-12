@@ -1,35 +1,39 @@
-//! CfgClient - bidirectional bridge to the guest's `cdj3k-cfgd` daemon.
+//! `CfgClient` is a two-way bridge to the guest's `cdj3k-cfgd` daemon.
 //!
 //! One Unix socket (`{sock_dir}/cfg.sock`) carries USB attach/detach commands,
 //! `set`/`get` for the whitelisted virtio_snd sysfs parameters, an
 //! unsolicited 3-second latency push, and the boot's mods report.
 //!
-//! Wire protocol (line-based, ASCII, '\n'-terminated):
+//! The wire protocol uses ASCII lines that end in `\n`:
 //!
-//!   host → guest
-//!     usb attach              - invoke /usr/sbin/usb-external-attach.sh
-//!     usb detach              - no-op (EP122 handles unmount)
+//!   Host to guest
+//!     usb attach              - run /usr/sbin/usb-external-attach.sh
+//!     usb detach              - notify EP122 through /proc/udev_usb1 and
+//!                               lazily unmount the drive
 //!     set <name> <value>      - write to a whitelisted sysfs param
 //!     get <name>              - request a `param` response
+//!     pc_link on|off          - start or stop the PC Link bridge service
 //!     mods status             - request the mods report
 //!                               (sent on every connection)
 //!     mods log <name>         - request a mod's journal for this boot
+//!     ping                    - request a `pong`
 //!
-//!   guest → host
+//!   Guest to host
 //!     usb_state <0|1>         - emitted by the in-guest USB hooks
 //!     param <name> <value>    - response to `get` or unsolicited push
 //!     latency <g>,<h>,<t>     - pushed every 3s by cdj3k-cfgd
-//!     pc_link on|off          - confirms a host-issued pc_link toggle
+//!     pc_link on|off          - confirms a `pc_link` command
 //!     pc_link on_failed|off_failed - systemctl returned non-zero
+//!     pong                    - the answer to `ping`
 //!     mods off|pending        - the boot has no mods / the runner has not finished
 //!     mods begin, mod <name> …, mods end
 //!                             - the runner's report ([`crate::mods_report::ModOutcome`])
 //!     log_begin <name>, log <name> <line>, log_end <name>
 //!                             - a mod's journal, in answer to each `mods log`
 //!
-//! Connection is lazy and self-healing: the reader thread reconnects on EOF
-//! / connect failure, the writer methods retry briefly while QEMU is still
-//! bringing the port up.
+//! The connection is lazy and self-healing. The reader thread reconnects
+//! after an EOF or a failed connect, and the writer methods queue commands
+//! until cfgd answers.
 
 use cdj3k_emu_platform::local_socket::LocalStream as UnixStream;
 use std::collections::HashMap;
@@ -41,9 +45,13 @@ use std::time::{Duration, Instant};
 
 use crate::mods_report::{ModsReport, Partial};
 
-/// Backoff between reader-thread reconnect attempts. Long enough not to thrash
-/// QEMU while it's spinning up its virtio-serial port, short enough that the
-/// "first frame" UX (latency label, USB state) lights up promptly.
+mod messages;
+
+use messages::handle_line;
+
+/// The delay between reconnect attempts of the reader thread. It is long
+/// enough not to flood QEMU while it brings up its virtio-serial port, and
+/// short enough that the latency label and the USB state appear promptly.
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const PING_PERIOD: Duration = Duration::from_secs(1);
 
@@ -57,21 +65,21 @@ pub struct Latency {
 
 #[derive(Default)]
 struct Shared {
-    /// Latest USB mount state from the guest (`true` = mounted).
+    /// The latest USB mount state from the guest; `true` means mounted.
     usb_state: Option<bool>,
-    /// Latest latency push.
+    /// The latest latency push.
     latency: Option<Latency>,
-    /// Most recent `param <name> <value>` response per name.
+    /// The latest `param <name> <value>` response for each name.
     params: HashMap<String, String>,
-    /// Last confirmed PC-link bridge state from the guest.
-    /// `Some(true)` = bridge running, `Some(false)` = bridge stopped,
-    /// `None` = no `pc_link` response observed yet.
+    /// The last PC Link bridge state that the guest confirmed: `Some(true)`
+    /// when the bridge runs, `Some(false)` when it is stopped, and `None`
+    /// until the first `pc_link` response.
     pc_link_state: Option<bool>,
     /// `pc_link` replies that reported a failure rather than a state.  An
     /// unanswered command means the guest has not opened the port yet; a
     /// failure reply means cfgd ran systemctl and it did not work.
     pc_link_failures: u32,
-    /// Writer half - `None` while disconnected.
+    /// The writer half of the stream, or `None` while disconnected.
     writer: Option<UnixStream>,
     /// Set once the guest has sent a line, which proves cfgd has the port
     /// open. QEMU accepts the host connection whether or not the guest is
@@ -96,8 +104,8 @@ pub struct CfgClient {
 }
 
 impl CfgClient {
-    /// Spawn the background reader thread and return a handle.
-    /// `sock_dir` is e.g. `/tmp/cdj3k-emu/instance-1`; the socket is `{sock_dir}/cfg.sock`.
+    /// Start the reader and ping threads and return a handle.
+    /// `sock_dir` is the instance directory; the socket is `{sock_dir}/cfg.sock`.
     pub fn new(sock_dir: &std::path::Path) -> Self {
         let sock_path = sock_dir.join("cfg.sock");
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -107,13 +115,13 @@ impl CfgClient {
         thread::Builder::new()
             .name("cfg-stream".into())
             .spawn(move || reader_loop(path, weak))
-            .expect("spawn cfg-stream thread");
+            .expect("the cfg-stream thread should start");
 
         let weak = Arc::downgrade(&shared);
         thread::Builder::new()
             .name("cfg-ping".into())
             .spawn(move || ping_loop(weak))
-            .expect("spawn cfg-ping thread");
+            .expect("the cfg-ping thread should start");
 
         Self { shared }
     }
@@ -124,14 +132,14 @@ impl CfgClient {
         self.shared.lock().ok()?.usb_state
     }
 
-    /// Take the next pending USB-state transition (consumes the cached value
-    /// so callers can use this in a poll loop just like the old watcher).
+    /// Take the latest USB state. This consumes the cached value, so callers
+    /// can use it in a poll loop.
     pub fn poll_usb_state(&self) -> Option<bool> {
         let mut s = self.shared.lock().ok()?;
         s.usb_state.take()
     }
 
-    /// Latest latency triple. `None` until the first push lands.
+    /// The latest latency triple, or `None` until the first push arrives.
     pub fn latency(&self) -> Option<Latency> {
         self.shared.lock().ok()?.latency
     }
@@ -141,13 +149,14 @@ impl CfgClient {
         self.shared.lock().ok()?.params.get(name).cloned()
     }
 
-    /// Latest confirmed PC-link bridge state.  `None` if the host hasn't
-    /// toggled it yet (or no response has come back).
+    /// The latest confirmed PC Link bridge state, or `None` until a
+    /// `pc_link` response arrives.
     pub fn pc_link_state(&self) -> Option<bool> {
         self.shared.lock().ok()?.pc_link_state
     }
 
-    /// Forget the last pc_link echo so the reconcile re-issues on a state change.
+    /// Forget the last `pc_link` reply, so that the reconcile loop sends the
+    /// command again when the state changes.
     pub fn reset_pc_link_state(&self) {
         if let Ok(mut s) = self.shared.lock() {
             s.pc_link_state = None;
@@ -155,17 +164,14 @@ impl CfgClient {
         }
     }
 
-    /// Count of `pc_link *_failed` / `?` replies since the last reset.
+    /// The number of `pc_link *_failed` and `?` replies since the last reset.
     pub fn pc_link_failures(&self) -> u32 {
         self.shared.lock().map(|s| s.pc_link_failures).unwrap_or(0)
     }
 
-    /// `true` once the reader thread has connected to the cfg unix socket
-    /// (and thus stashed a live writer half for the fast send_line path).
-    /// Independent of any guest-side activity; proves only that the QEMU
-    /// chardev is reachable and cfgd has accepted the host's connection on
-    /// its end.  Used as an audio-independent "cfg channel is live" gate
-    /// for one-shot cold-start commands like `pc_link on`.
+    /// `true` once the reader thread has connected to the cfg Unix socket and
+    /// holds a writer half. This proves only that the QEMU chardev accepted
+    /// the connection; [`Self::guest_heard`] tells whether cfgd is reading.
     pub fn is_connected(&self) -> bool {
         self.shared
             .lock()
@@ -179,7 +185,6 @@ impl CfgClient {
         self.shared.lock().map(|s| s.guest_ready).unwrap_or(false)
     }
 
-    /// The guest's mods report for this boot.
     /// Forget the mods report and journals of the boot that ended, so the
     /// next boot's report counts as new even when it reads the same.
     pub fn new_boot(&self) {
@@ -191,6 +196,7 @@ impl CfgClient {
         }
     }
 
+    /// The guest's mods report for this boot.
     pub fn mods_report(&self) -> ModsReport {
         self.shared
             .lock()
@@ -220,20 +226,21 @@ impl CfgClient {
         self.shared.lock().ok()?.mod_logs.get(name).cloned()
     }
 
-    /// Send `usb attach\n`. Retries briefly while the port is still coming up.
+    /// Send `usb attach\n`. The command waits in the queue until cfgd answers.
     pub fn usb_attach(&self) -> std::io::Result<()> {
         self.send_line("usb attach\n")
     }
 
-    /// Send `usb detach\n`. No-op on the guest side (EP122 handles unmount).
+    /// Send `usb detach\n`. cfgd tells EP122 through `/proc/udev_usb1` to
+    /// close its files, then lazily unmounts the drive.
     pub fn usb_detach(&self) -> std::io::Result<()> {
         self.send_line("usb detach\n")
     }
 
-    /// Toggle the PC-link bridge in the guest.  `on=true` starts
-    /// `cdj3k-pc-link-bridge.service` which begins pumping the gadget's
-    /// HID + MIDI endpoints out the `cdj3k.usb-link` virtio-serial port;
-    /// `on=false` stops it, which the host side observes as a socket EOF.
+    /// Turn the PC Link bridge in the guest on or off. When `on` is true, this
+    /// starts `cdj3k-pc-link-bridge.service`, which forwards the gadget's HID
+    /// and MIDI endpoints over the `cdj3k.usb-link` virtio-serial port. When
+    /// `on` is false, it stops the service, and the host sees a socket EOF.
     pub fn pc_link(&self, on: bool) -> std::io::Result<()> {
         self.send_line(if on { "pc_link on\n" } else { "pc_link off\n" })
     }
@@ -244,7 +251,7 @@ impl CfgClient {
         if name.contains(' ') || value.contains('\n') {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "param name/value must not contain spaces / newlines",
+                "a param name cannot contain spaces, and a param value cannot contain newlines",
             ));
         }
         self.send_line(&format!("set {} {}\n", name, value))
@@ -256,7 +263,7 @@ impl CfgClient {
         if name.contains(' ') {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "param name must not contain spaces",
+                "a param name cannot contain spaces",
             ));
         }
         self.send_line(&format!("get {}\n", name))
@@ -264,7 +271,7 @@ impl CfgClient {
 
     fn send_line(&self, line: &str) -> std::io::Result<()> {
         let Ok(mut s) = self.shared.lock() else {
-            return Err(std::io::Error::other("cfg state poisoned"));
+            return Err(std::io::Error::other("the cfg client state is poisoned"));
         };
         if s.guest_ready {
             if let Some(w) = s.writer.as_mut() {
@@ -280,8 +287,9 @@ impl CfgClient {
     }
 }
 
-/// Connect, read cfgd's lines, reconnect after QEMU goes; ends once the client
-/// is dropped, since QEMU serves one connection on the socket.
+/// Connect to the socket, read cfgd's lines, and reconnect after QEMU exits.
+/// The loop ends once the client is dropped, because QEMU serves one
+/// connection on the socket.
 fn reader_loop(sock_path: PathBuf, shared: std::sync::Weak<Mutex<Shared>>) {
     loop {
         if shared.strong_count() == 0 {
@@ -295,7 +303,7 @@ fn reader_loop(sock_path: PathBuf, shared: std::sync::Weak<Mutex<Shared>>) {
             }
         };
 
-        // Stash a clone for writers.
+        // Keep a clone of the stream for the writer methods.
         {
             let Some(shared) = shared.upgrade() else {
                 return;
@@ -323,8 +331,8 @@ fn reader_loop(sock_path: PathBuf, shared: std::sync::Weak<Mutex<Shared>>) {
             handle_line(&line, &shared);
         }
 
-        // Disconnected: drop the writer and clear the pc_link echo so a QEMU
-        // restart re-issues the command. The mods report belongs to the boot
+        // The connection closed. Drop the writer and clear the pc_link reply,
+        // so that a QEMU restart sends the command again. The mods report belongs to the boot
         // that ended; the next connection requests it again.
         let Some(shared) = shared.upgrade() else {
             return;
@@ -344,8 +352,9 @@ fn reader_loop(sock_path: PathBuf, shared: std::sync::Weak<Mutex<Shared>>) {
     }
 }
 
-/// `ping` until cfgd answers on the current connection; cfgd's own pushes
-/// need the audio driver. Bypasses the queue. Ends when the client is dropped.
+/// Send `ping` until cfgd answers on the current connection, because cfgd's
+/// own pushes need the audio driver. The pings bypass the queue, and the loop
+/// ends when the client is dropped.
 fn ping_loop(shared: std::sync::Weak<Mutex<Shared>>) {
     while let Some(shared) = shared.upgrade() {
         if let Ok(mut s) = shared.lock() {
@@ -360,8 +369,8 @@ fn ping_loop(shared: std::sync::Weak<Mutex<Shared>>) {
     }
 }
 
-/// A line from the guest proves cfgd is reading: mark it ready and write
-/// whatever was queued meanwhile.
+/// A line from the guest proves that cfgd is reading. Mark the guest ready
+/// and write the commands queued in the meantime.
 fn flush_pending(shared: &Arc<Mutex<Shared>>) {
     let Ok(mut s) = shared.lock() else { return };
     if s.guest_ready {
@@ -377,85 +386,6 @@ fn flush_pending(shared: &Arc<Mutex<Shared>>) {
     }
 }
 
-fn handle_line(line: &str, shared: &Arc<Mutex<Shared>>) {
-    let line = line.trim();
-    if line.is_empty() {
-        return;
-    }
-    flush_pending(shared);
-
-    if let Some(rest) = line.strip_prefix("usb_state ") {
-        let mounted = rest.trim() == "1";
-        if let Ok(mut s) = shared.lock() {
-            s.usb_state = Some(mounted);
-        }
-        return;
-    }
-
-    if let Some(rest) = line.strip_prefix("latency ") {
-        let mut parts = rest.split(',');
-        let g = parts.next().and_then(|x| x.trim().parse().ok());
-        let h = parts.next().and_then(|x| x.trim().parse().ok());
-        let t = parts.next().and_then(|x| x.trim().parse().ok());
-        if let (Some(g), Some(h), Some(t)) = (g, h, t) {
-            if let Ok(mut s) = shared.lock() {
-                s.latency = Some(Latency {
-                    guest_ms: g,
-                    host_ms: h,
-                    total_ms: t,
-                    at: Instant::now(),
-                });
-            }
-        }
-        return;
-    }
-
-    if let Some(rest) = line.strip_prefix("param ") {
-        if let Some(space) = rest.find(' ') {
-            let (name, value) = rest.split_at(space);
-            let value = value.trim_start();
-            if let Ok(mut s) = shared.lock() {
-                s.params.insert(name.to_string(), value.to_string());
-            }
-        }
-        return;
-    }
-
-    if handle_mods_line(line, shared) {
-        return;
-    }
-
-    if let Some(rest) = line.strip_prefix("pc_link ") {
-        // Guest replies: "on", "off", "on_failed", "off_failed", "?".
-        // Anything else is a protocol mismatch; log and ignore.
-        let state = match rest.trim() {
-            "on" => Some(true),
-            "off" => Some(false),
-            "on_failed" | "off_failed" | "?" => {
-                eprintln!("cfg: guest reported pc_link {}", rest.trim());
-                if let Ok(mut s) = shared.lock() {
-                    s.pc_link_failures = s.pc_link_failures.saturating_add(1);
-                }
-                None
-            }
-            other => {
-                eprintln!("cfg: unrecognised pc_link response '{other}'");
-                return;
-            }
-        };
-        if let Some(v) = state {
-            if let Ok(mut s) = shared.lock() {
-                s.pc_link_state = Some(v);
-            }
-        }
-    }
-}
-
-/// The maximum number of lines kept from a mod's journal (cfgd sends at
-/// most 500).
-const MOD_LOG_LINES: usize = 600;
-/// The maximum length of a journal line, in bytes; a longer line is cut.
-const MOD_LOG_LINE_MAX: usize = 1024;
 /// The maximum length of a line from the guest, in bytes. A longer line is
 /// read to its end and dropped.
 const LINE_MAX: usize = 64 << 10;
@@ -491,68 +421,6 @@ fn next_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Op
     Ok(Some(line.trim_end_matches('\r').to_string()))
 }
 
-/// `s` truncated to at most `max` bytes, at a character boundary.
-fn clip(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Handle a `mods`, `mod` or `log*` line; `false` for any other line.
-/// Journal lines are kept only for a mod whose journal
-/// [`CfgClient::request_mod_log`] requested, and only the answer to the
-/// latest request is kept.
-fn handle_mods_line(line: &str, shared: &Arc<Mutex<Shared>>) -> bool {
-    let Ok(mut s) = shared.lock() else {
-        return true;
-    };
-    if let Some(name) = line.strip_prefix("log_begin ") {
-        if let Some((_, lines)) = s.mod_logs_partial.get_mut(name) {
-            lines.clear();
-        }
-    } else if let Some(rest) = line.strip_prefix("log ") {
-        let (name, text) = rest.split_once(' ').unwrap_or((rest, ""));
-        if let Some((_, lines)) = s.mod_logs_partial.get_mut(name) {
-            if lines.len() < MOD_LOG_LINES {
-                lines.push(clip(text, MOD_LOG_LINE_MAX).to_string());
-            }
-        }
-    } else if let Some(name) = line.strip_prefix("log_end ") {
-        if let Some((due, _)) = s.mod_logs_partial.get_mut(name) {
-            *due -= 1;
-            if *due == 0 {
-                let (_, lines) = s.mod_logs_partial.remove(name).unwrap_or_default();
-                s.mod_logs.insert(name.to_string(), lines);
-            }
-        }
-    } else if let Some(rest) = line.strip_prefix("mods ") {
-        match rest {
-            "off" => s.mods = ModsReport::Off,
-            "pending" => s.mods = ModsReport::Pending,
-            "begin" => s.mods_partial = Some(Partial::default()),
-            // An end without its begin is the tail of a report sent before
-            // the host connected.
-            "end" => match s.mods_partial.take() {
-                Some(partial) => s.mods = partial.done(),
-                None => eprintln!("cfg: mods end without mods begin, ignored"),
-            },
-            other => eprintln!("cfg: unrecognised mods line '{other}'"),
-        }
-    } else if let Some(rest) = line.strip_prefix("mod ") {
-        if !s.mods_partial.as_mut().is_some_and(|p| p.push(rest)) {
-            eprintln!("cfg: unexpected mod line '{rest}'");
-        }
-    } else {
-        return false;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,41 +436,5 @@ mod tests {
             lines.push(line);
         }
         assert_eq!(lines, ["a", "", "b", "c"]);
-    }
-
-    #[test]
-    fn a_journal_asked_twice_keeps_the_last_answer_whole() {
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let feed = |lines: &[&str]| {
-            for l in lines {
-                assert!(handle_mods_line(l, &shared));
-            }
-        };
-        let log = |name: &str| shared.lock().unwrap().mod_logs.get(name).cloned();
-        shared
-            .lock()
-            .unwrap()
-            .mod_logs_partial
-            .insert("a".into(), (1, Vec::new()));
-        feed(&["log_begin a", "log a one"]);
-        // Requested again while the first answer is still arriving.
-        shared
-            .lock()
-            .unwrap()
-            .mod_logs_partial
-            .get_mut("a")
-            .unwrap()
-            .0 += 1;
-        feed(&["log a two", "log_end a", "log b stray", "log_end b"]);
-        assert_eq!(log("a"), None);
-        assert_eq!(log("b"), None, "never asked for");
-        feed(&[
-            "log_begin a",
-            "log a one",
-            "log a",
-            "log a two",
-            "log_end a",
-        ]);
-        assert_eq!(log("a").unwrap(), ["one", "", "two"]);
     }
 }
