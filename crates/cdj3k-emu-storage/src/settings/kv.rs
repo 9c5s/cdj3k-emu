@@ -2,7 +2,7 @@
 //! hold, and the atomic locked read/write both settings structs go through.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -68,7 +68,16 @@ pub(super) const APP_KEYS: &[&str] = &[
 pub fn prune_app_file() {
     let _g = locked();
     let path = app_path();
-    let map = read_kv(&path);
+    let map = match try_read_kv(&path) {
+        Ok(map) => map,
+        Err(e) => {
+            eprintln!(
+                "cdj3k-emu-storage: could not read {}, so it is not pruned: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
     if map.keys().all(|k| APP_KEYS.contains(&k.as_str())) {
         return; // already clean, or no file at all
     }
@@ -81,16 +90,25 @@ pub fn prune_app_file() {
     }
 }
 
+/// The `key=value` pairs in `path`, or an empty map when the file cannot be
+/// read. Only read-only callers use it; a writer goes through [`try_read_kv`].
 pub(crate) fn read_kv(path: &Path) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    if let Ok(s) = std::fs::read_to_string(path) {
-        for line in s.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-    }
-    map
+    try_read_kv(path).unwrap_or_default()
+}
+
+/// The `key=value` pairs in `path`. A missing file is an empty map; any other
+/// failure, such as a permission error or a byte that is not UTF-8, is an
+/// error, so that a writer does not replace a file it could not read.
+pub(super) fn try_read_kv(path: &Path) -> io::Result<BTreeMap<String, String>> {
+    let s = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(s.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect())
 }
 
 /// `key` as a flag: `1` or `true` (any case) is on, anything else off, and
@@ -117,9 +135,9 @@ pub(super) fn text(map: &BTreeMap<String, String>, key: &str) -> Option<String> 
 }
 
 /// Write the keys of `map` that `known` lists to `path`, atomically: the text
-/// goes to a sibling temp file that is renamed over `path`, so a concurrent
-/// reader sees the old or the new file, never an empty one (an empty read would
-/// mint a new MAC).
+/// goes to a sibling temp file, which is synced to disk and then renamed over
+/// `path`. A concurrent reader, or a host that loses power, sees the old or
+/// the new file, never an empty one (an empty read would mint a new MAC).
 ///
 /// Anything outside `known` is dropped - a key a release retired, or one a
 /// hand-edit left behind. Pass the registry of the file being written
@@ -134,8 +152,17 @@ pub(super) fn write_kv(
     }
     let buf = kv_text(map.iter().filter(|(k, _)| known.contains(&k.as_str())));
     let tmp = path.with_extension(format!("txt.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, buf)?;
-    std::fs::rename(&tmp, path)
+    let written = write_synced(&tmp, buf.as_bytes()).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// `pairs` as `key=value` lines, the format of every settings file.
@@ -163,7 +190,7 @@ mod tests {
         // populated one also proves the value survives the filter.
         InstanceSettings {
             mac: "02:11:22:33:44:55".into(),
-            soc_serial: "0123456789abcd05".into(),
+            soc_serial: Some("0123456789abcd05".into()),
             audio_enabled: true,
             audio_device_uid: Some("uid".into()),
             alc_enabled: true,
@@ -203,7 +230,7 @@ mod tests {
         // Nothing was lost to the other struct's save.
         let s = InstanceSettings::load_or_init(slot);
         assert_eq!(s.mac, "02:11:22:33:44:55");
-        assert_eq!(s.soc_serial, "0123456789abcd05");
+        assert_eq!(s.soc_serial.as_deref(), Some("0123456789abcd05"));
         assert_eq!(s.firmware_release.as_deref(), Some("3.20"));
         assert_eq!(PanelSettings::load(slot).jog_adjust, 0.75);
     }

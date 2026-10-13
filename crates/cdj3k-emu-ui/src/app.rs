@@ -224,6 +224,9 @@ pub struct CdjApp {
     /// linearly toward the target each frame, so the overlay fades in or out
     /// over 1 s.
     shade_alpha: f32,
+    /// The slot cannot boot until it is reinstalled, so the shade says so in
+    /// place of the spinner and QEMU is not started.
+    pub(super) broken: bool,
     /// `true` until the boot guard clears, while `target_alpha` is above zero.
     /// The main LCD and jog LCD textures are blank while it is set.
     lcds_blanked: bool,
@@ -315,8 +318,7 @@ impl CdjApp {
         }
         let panel = prepare_panel(&egui_ctx);
         let repaint_gate = RepaintGate::new(egui_ctx.clone(), MIN_FRAME_INTERVAL);
-        // `--no-spawn` never shows the boot shade, so the shade must not fade
-        // from opaque either; chassis captures then match from frame to frame.
+        // `--no-spawn` shows no shade, so it starts transparent instead of opaque.
         let ui_only = menu_state::lock().ui_only;
         Self {
             model,
@@ -385,6 +387,7 @@ impl CdjApp {
             qemu_running_since: None,
             qemu_was_running: false,
             shade_alpha: if ui_only { 0.0 } else { 1.0 },
+            broken: false,
             lcds_blanked: !ui_only,
             lcd_textures_need_blank: false,
         }
@@ -470,8 +473,8 @@ impl CdjApp {
 
         // Mark shutdown so the runtime worker sees it at the top of its next
         // loop iteration and runs `instance.stop()`. That sends
-        // POWER_OFF_STIMULI, then ACPI system_powerdown, then QMP quit, each
-        // step with its own watchdog.
+        // POWER_OFF_STIMULI and then QMP quit, each step with its own
+        // watchdog.
         cdj3k_emu_platform::menu_state::APP_SHUTDOWN
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -493,8 +496,8 @@ impl CdjApp {
         .save(instance_id);
 
         // Wait for the worker to finish its graceful QEMU stop. The budget
-        // covers `instance.stop()`: 8 s for the EP122 cleanup, 20 s for the
-        // ACPI shutdown and 5 s for QMP quit, plus a small margin.
+        // covers `instance.stop()`: 8 s for the EP122 cleanup and 2 s for
+        // QMP quit, plus a small margin.
         let joined = cdj3k_emu_runtime::wait_for_worker(SHUTDOWN_WATCHDOG);
         if !joined {
             // The watchdog elapsed, so fall back to SIGTERM and SIGKILL on the
@@ -511,9 +514,9 @@ impl CdjApp {
 }
 
 /// The longest time the runtime worker gets for the graceful QEMU stop before
-/// the app falls back to SIGTERM and SIGKILL. It covers the 8, 20 and 5 s steps
-/// of `instance.stop()` plus loop overhead.
-const SHUTDOWN_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(35);
+/// the app falls back to SIGTERM and SIGKILL. It covers the 8 and 2 s steps of
+/// `instance.stop()` plus loop overhead.
+const SHUTDOWN_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(12);
 
 impl CdjApp {
     /// The reference canvas of the active slate. The window keeps its aspect
